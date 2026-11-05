@@ -1,0 +1,13 @@
+# 运行时状态文件
+.float_pos.json
+.float_watch.json
+.float_err.log
+
+# 打包产物
+*.zip
+dist/
+
+# 临时文件
+*.tmp
+_*.ps1
+_*.js
