@@ -146,6 +146,14 @@ function Pd([double]$v) {
     return $r
 }
 
+# ---------- 双缓冲（自定义绘制的控件开双缓冲，强制重绘时不闪） ----------
+function Set-DoubleBuffered($ctrl) {
+    try {
+        $pi = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        if ($null -ne $pi) { $pi.SetValue($ctrl, $true) }
+    } catch { }
+}
+
 # ---------- 窗体 ----------
 $form = New-Object System.Windows.Forms.Form
 $form.AutoScaleMode   = [System.Windows.Forms.AutoScaleMode]::None
@@ -159,6 +167,7 @@ $form.ClientSize      = [System.Drawing.Size]::new(320, 184)
 $form.Opacity         = $script:Alpha
 $form.Text            = "悬浮股价"
 $form.KeyPreview      = $true
+Set-DoubleBuffered $form
 $script:Form = $form
 
 # 取真实 DPI
@@ -172,6 +181,7 @@ try {
 # ---------- 顶栏 ----------
 $header = New-Object System.Windows.Forms.Panel
 $header.BackColor = $script:C.Head
+Set-DoubleBuffered $header
 $form.Controls.Add($header)
 
 # 普通扁平按钮（供输入对话框使用，尺寸较大，不存在裁字问题）
@@ -193,6 +203,7 @@ function New-ModeBtn([string]$text) {
     $b.BackColor = $script:C.Head
     $b.Cursor    = [System.Windows.Forms.Cursors]::Hand
     $b.Tag       = @{ Text = $text; On = $false; Hover = $false }
+    Set-DoubleBuffered $b
     $b.Add_Paint({
         param($s, $e)
         $g = $e.Graphics
@@ -245,6 +256,7 @@ function New-MinBtn {
     $b = New-Object System.Windows.Forms.Panel
     $b.BackColor = $script:C.Head
     $b.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    Set-DoubleBuffered $b
     $b.Add_Paint({
         param($s, $e)
         $g = $e.Graphics
@@ -279,12 +291,14 @@ $header.Controls.Add($btnClose)
 # ---------- 主体 ----------
 $body = New-Object System.Windows.Forms.Panel
 $body.BackColor = $script:C.Bg
+Set-DoubleBuffered $body
 $form.Controls.Add($body)
 
 # ---------- 缩放手柄 ----------
 $grip = New-Object System.Windows.Forms.Panel
 $grip.BackColor = $script:C.Bg
 $grip.Cursor    = [System.Windows.Forms.Cursors]::SizeNWSE
+Set-DoubleBuffered $grip
 $grip.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
@@ -891,6 +905,11 @@ function Layout-UI {
     $grip.Location = [System.Drawing.Point]::new(($W - $gw), ($H - $gw))
     $grip.Size     = [System.Drawing.Size]::new($gw, $gw)
     $grip.BringToFront()
+
+    # 拖动缩放时鼠标移动会把 WM_PAINT 饿死在消息队列里，顶栏按钮会停在旧尺寸，
+    # 必须在这里强制同步重绘一次，按钮才不会“等鼠标移上去才恢复”。
+    $form.Invalidate($true)
+    $form.Update()
 }
 
 # ---------- 主题按钮 ----------
