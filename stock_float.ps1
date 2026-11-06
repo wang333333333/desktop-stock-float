@@ -579,9 +579,12 @@ function New-Menu([string]$code) {
     [void]$m.Items.Add($miTop)
 
     $miSize = [System.Windows.Forms.ToolStripMenuItem]::new("大小")
+    $miSize.ShowCheckMargin = $true
     foreach ($v in @(70, 85, 100, 115, 130, 150, 180)) {
         $it = [System.Windows.Forms.ToolStripMenuItem]::new("$v%")
         $it.Tag = $v
+        $it.CheckOnClick = $false
+        $it.ShowCheckMargin = $true
         $it.Add_Click({
             $script:Scale = [double]$this.Tag / 100.0
             Layout-UI
@@ -593,9 +596,12 @@ function New-Menu([string]$code) {
     [void]$m.Items.Add($miSize)
 
     $miAlpha = [System.Windows.Forms.ToolStripMenuItem]::new("透明度")
+    $miAlpha.ShowCheckMargin = $true
     foreach ($v in @(100, 93, 86, 75, 62, 48)) {
         $it = [System.Windows.Forms.ToolStripMenuItem]::new("$v%")
         $it.Tag = $v
+        $it.CheckOnClick = $false
+        $it.ShowCheckMargin = $true
         $it.Add_Click({
             $script:Alpha = [double]$this.Tag / 100.0
             $script:Form.Opacity = $script:Alpha
@@ -606,6 +612,7 @@ function New-Menu([string]$code) {
     [void]$m.Items.Add($miAlpha)
 
     $miRate = [System.Windows.Forms.ToolStripMenuItem]::new("刷新频率")
+    $miRate.ShowCheckMargin = $true
     $rates = @(
         @{ T = "自动（盘中 1 秒）"; V = "auto" },
         @{ T = "1 秒（极速）";      V = 1000 },
@@ -616,6 +623,8 @@ function New-Menu([string]$code) {
     foreach ($rr in $rates) {
         $it = [System.Windows.Forms.ToolStripMenuItem]::new($rr.T)
         $it.Tag = $rr.V
+        $it.CheckOnClick = $false
+        $it.ShowCheckMargin = $true
         $it.Add_Click({
             if ([string]$this.Tag -eq "auto") { $script:RateMode = "auto"; $script:RateMs = 0 }
             else { $script:RateMode = "manual"; $script:RateMs = [int]$this.Tag }
@@ -627,12 +636,20 @@ function New-Menu([string]$code) {
     [void]$m.Items.Add($miRate)
 
     $m.Add_Opening({
-        $mr = $null
-        foreach ($x in $this.Items) { if ($x.Text -eq "刷新频率") { $mr = $x } }
-        if ($null -ne $mr) {
-            foreach ($cc in $mr.DropDown.Items) {
-                if ([string]$cc.Tag -eq "auto") { $cc.Checked = ($script:RateMode -eq "auto") }
-                else { $cc.Checked = ($script:RateMode -eq "manual" -and [int]$cc.Tag -eq $script:RateMs) }
+        $curScale = [int][Math]::Round($script:Scale * 100)
+        $curAlpha = [int][Math]::Round($script:Alpha * 100)
+        foreach ($x in $this.Items) {
+            if ($x.Text -eq "大小") {
+                foreach ($cc in $x.DropDown.Items) { $cc.Checked = ([int]$cc.Tag -eq $curScale) }
+            }
+            elseif ($x.Text -eq "透明度") {
+                foreach ($cc in $x.DropDown.Items) { $cc.Checked = ([int]$cc.Tag -eq $curAlpha) }
+            }
+            elseif ($x.Text -eq "刷新频率") {
+                foreach ($cc in $x.DropDown.Items) {
+                    if ([string]$cc.Tag -eq "auto") { $cc.Checked = ($script:RateMode -eq "auto") }
+                    else { $cc.Checked = ($script:RateMode -eq "manual" -and [int]$cc.Tag -eq $script:RateMs) }
+                }
             }
         }
     })
