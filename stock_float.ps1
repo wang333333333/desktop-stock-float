@@ -81,12 +81,14 @@ $script:MinAt      = @{}     # code -> 上次拉分时的时刻
 $script:MinFail    = 0       # 分时连续失败次数，用于退避
 $script:Chart      = $null
 
-# 列表滚动：股票多了不可能一直往下加长窗口，超出行数后改为内部滚动
-$script:CapHeight  = $true   # 高度封顶开关（右键菜单可关，关掉就是老行为：全部铺开）
+# 列表滚动：一屏最多显示 N 只，超出后窗口高度固定、列表内部滚动
+# 0 = 自动（按屏幕工作区 60% 折算行数）；2/4/6/8/10 = 固定一屏几只
+$script:RowsCap    = 6
 $script:TopRow     = 0       # 首个可见行的索引
 $script:VisRows    = 99      # 当前一屏能放下的行数
 $script:MaxTopRow  = 0       # TopRow 的上限（= 总数 - 一屏行数）
 $script:Scrollable = $false  # 本帧是否需要滚动
+$script:LastH      = 0       # 上一帧窗口高度，用于判断要不要全量重绘
 $script:ScrollBar  = $null
 $script:SbDrag     = $false
 $script:SbY        = 0
@@ -113,7 +115,8 @@ $Themes = @{
     light = @{
         Bg    = [System.Drawing.Color]::FromArgb(255, 255, 255)
         Head  = [System.Drawing.Color]::FromArgb(247, 248, 250)
-        Line  = [System.Drawing.Color]::FromArgb(228, 231, 235)
+        # 浅色下 228 的分隔线在白底上几乎看不见，压到 221 才够对得上深色主题的对比
+        Line  = [System.Drawing.Color]::FromArgb(221, 225, 232)
         Text  = [System.Drawing.Color]::FromArgb(31, 35, 40)
         Sub   = [System.Drawing.Color]::FromArgb(122, 128, 136)
         Up    = [System.Drawing.Color]::FromArgb(214, 48, 36)
@@ -323,6 +326,7 @@ $script:Chart = $chart
 
 $chart.Add_Paint({
     param($s, $e)
+    try {
     $g = $e.Graphics
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $c = $script:C
@@ -473,6 +477,9 @@ $chart.Add_Paint({
 
     $brSub.Dispose()
     $penTop.Dispose()
+    } catch {
+        Write-Log ("CHART ERR: " + $_.Exception.Message)
+    }
 })
 
 # ---------- 滚动条（列表超出一屏时才出现，只占右侧 9px，不挤压内容） ----------
@@ -613,11 +620,7 @@ function Request-Quotes([string]$codes) {
 # 接口：https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh601088
 # 每行格式 "HHmm 价格 累计量(手) 累计额(元)"，一整天 240 个槽位（09:30-11:30、13:00-15:00）
 # A = 当日均价（累计额 ÷ 累计股数），即分时图上的黄色均价线
-function Request-Minutes([string]$code) {
-    $out = @()
-    if (-not $code) { return $out }
-    $url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=$code"
-    $txt = $null
+function Request-Http([string]$url) {
     try {
         $req = [System.Net.HttpWebRequest]::Create($url)
         $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -629,37 +632,78 @@ function Request-Minutes([string]$code) {
         $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
         $txt = $sr.ReadToEnd()
         $sr.Close(); $resp.Close()
+        return $txt
     } catch {
-        return $out
+        return $null
     }
-    if (-not $txt) { return $out }
+}
 
-    try {
-        $j = $txt | ConvertFrom-Json
-        $node = $j.data.PSObject.Properties[$code]
-        if ($null -eq $node) { return $out }
-        foreach ($line in @($node.Value.data.data)) {
-            $p = ([string]$line) -split ' '
-            if ($p.Count -lt 2) { continue }
-            $t = $p[0]
-            if ($t -notmatch '^\d{4}$') { continue }
-            $v = 0.0
-            if (-not [double]::TryParse($p[1], [ref]$v)) { continue }
-            $mins = ([int]$t.Substring(0, 2)) * 60 + [int]$t.Substring(2, 2)
-            if ($mins -le 690) { $idx = $mins - 570 } else { $idx = 120 + ($mins - 780) }
-            if ($idx -lt 0) { $idx = 0 }
-            if ($idx -gt 240) { $idx = 240 }
-            # 均价 = 累计成交额 / (累计成交量 × 100)，量单位是手
-            $avg = 0.0
-            if ($p.Count -ge 4) {
-                $vol = 0.0; $amt = 0.0
-                if ([double]::TryParse($p[2], [ref]$vol) -and [double]::TryParse($p[3], [ref]$amt) -and $vol -gt 0) {
-                    $avg = $amt / ($vol * 100.0)
+function Request-Minutes([string]$code) {
+    $out = @()
+    if (-not $code) { return $out }
+    # 腾讯 web.ifzq 有时整段返回 501，主域名 ifzq 仍然正常 —— 两个都试，别在一棵树上吊死
+    $urls = @(
+        "https://ifzq.gtimg.cn/appstock/app/minute/query?code=$code",
+        "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=$code"
+    )
+    $txt = $null
+    foreach ($u in $urls) {
+        $txt = Request-Http $u
+        if ($txt -and $txt.Length -gt 40) { break }
+        $txt = $null
+    }
+
+    if ($txt) {
+        try {
+            $j = $txt | ConvertFrom-Json
+            $node = $j.data.PSObject.Properties[$code]
+            if ($null -ne $node) {
+                foreach ($line in @($node.Value.data.data)) {
+                    $p = ([string]$line) -split ' '
+                    if ($p.Count -lt 2) { continue }
+                    $t = $p[0]
+                    if ($t -notmatch '^\d{4}$') { continue }
+                    $v = 0.0
+                    if (-not [double]::TryParse($p[1], [ref]$v)) { continue }
+                    $mins = ([int]$t.Substring(0, 2)) * 60 + [int]$t.Substring(2, 2)
+                    if ($mins -le 690) { $idx = $mins - 570 } else { $idx = 120 + ($mins - 780) }
+                    if ($idx -lt 0) { $idx = 0 }
+                    if ($idx -gt 240) { $idx = 240 }
+                    # 均价 = 累计成交额 / (累计成交量 × 100)，量单位是手
+                    $avg = 0.0
+                    if ($p.Count -ge 4) {
+                        $vol = 0.0; $amt = 0.0
+                        if ([double]::TryParse($p[2], [ref]$vol) -and [double]::TryParse($p[3], [ref]$amt) -and $vol -gt 0) {
+                            $avg = $amt / ($vol * 100.0)
+                        }
+                    }
+                    $out += [pscustomobject]@{ T = $t; P = $v; I = $idx; A = $avg }
                 }
             }
-            $out += [pscustomobject]@{ T = $t; P = $v; I = $idx; A = $avg }
-        }
-    } catch { }
+        } catch { }
+    }
+    if ($out.Count -gt 0) { return $out }
+
+    # 腾讯整站都不通时的兜底：新浪分时（自带均价字段，时间格式 09:30:00）
+    $stxt = Request-Http "https://quotes.sina.cn/cn/api/openapi.php/CN_MinlineService.getMinlineData?symbol=$code"
+    if ($stxt) {
+        try {
+            $sj = $stxt | ConvertFrom-Json
+            foreach ($pt in @($sj.result.data)) {
+                $mm = [string]$pt.m
+                if ($mm -notmatch '^(\d{2}):(\d{2})') { continue }
+                $v = 0.0
+                if (-not [double]::TryParse([string]$pt.p, [ref]$v)) { continue }
+                $mins = [int]$Matches[1] * 60 + [int]$Matches[2]
+                if ($mins -le 690) { $idx = $mins - 570 } else { $idx = 120 + ($mins - 780) }
+                if ($idx -lt 0) { $idx = 0 }
+                if ($idx -gt 240) { $idx = 240 }
+                $avg = 0.0
+                [void][double]::TryParse([string]$pt.avg_p, [ref]$avg)
+                $out += [pscustomobject]@{ T = ($Matches[1] + $Matches[2]); P = $v; I = $idx; A = $avg }
+            }
+        } catch { }
+    }
     return $out
 }
 
@@ -977,19 +1021,25 @@ function New-Menu([string]$code) {
     }
     [void]$m.Items.Add($miRate)
 
-    # 关掉就是老行为：有多少只就铺多高。默认开着，股票加多了也不会顶出屏幕
-    $miCap = [System.Windows.Forms.ToolStripMenuItem]::new("高度封顶（超出一屏可滚动）")
-    $miCap.Name = "miCap"
-    $miCap.CheckOnClick = $false
-    $miCap.ShowCheckMargin = $true
-    $miCap.Add_Click({
-        $script:CapHeight = -not $script:CapHeight
-        $script:TopRow = 0
-        Layout-UI
-        Clamp-Bounds
-        Save-Pos
-    })
-    [void]$m.Items.Add($miCap)
+    # 一屏显示几只：固定行数，超出的在列表内滚动。窗口高度从此是可预期的
+    $miRows = [System.Windows.Forms.ToolStripMenuItem]::new("每屏行数")
+    $miRows.Name = "miRows"
+    $miRows.ShowCheckMargin = $true
+    foreach ($rv in @(0, 2, 4, 6, 8, 10)) {
+        $it = [System.Windows.Forms.ToolStripMenuItem]::new($(if ($rv -eq 0) { "自动" } else { "$rv 只" }))
+        $it.Tag = $rv
+        $it.CheckOnClick = $false
+        $it.ShowCheckMargin = $true
+        $it.Add_Click({
+            $script:RowsCap = [int]$this.Tag
+            $script:TopRow = 0
+            Layout-UI
+            Clamp-Bounds
+            Save-Pos
+        })
+        [void]$miRows.DropDown.Items.Add($it)
+    }
+    [void]$m.Items.Add($miRows)
 
     $m.Add_Opening({
         $curScale = [int][Math]::Round($script:Scale * 100)
@@ -1010,8 +1060,8 @@ function New-Menu([string]$code) {
                     else { $cc.Checked = ($script:RateMode -eq "manual" -and [int]$cc.Tag -eq $script:RateMs) }
                 }
             }
-            elseif ($x.Name -eq "miCap") {
-                $x.Checked = $script:CapHeight
+            elseif ($x.Name -eq "miRows") {
+                foreach ($cc in $x.DropDown.Items) { $cc.Checked = ([int]$cc.Tag -eq [int]$script:RowsCap) }
             }
         }
     })
@@ -1157,6 +1207,17 @@ function Build-Rows {
     }
 }
 
+# ---------- 分层窗口补画 ----------
+# 窗体带 Opacity（分层窗口）时改尺寸，DWM 不会补画新增区域，那块会一直透出桌面。
+# 微调一次 Opacity 会强制重建分层表面并把整窗重新合成，再同步刷一遍。
+function Fix-Layered {
+    if ($script:Alpha -lt 1.0) {
+        $script:Form.Opacity = [math]::Min(1.0, $script:Alpha + 0.004)
+        $script:Form.Opacity = $script:Alpha
+    }
+    $script:Form.Refresh()
+}
+
 # ---------- 滚动 ----------
 # 滚动单位是「行」而不是像素：行高会随缩放变，按行走才不会滚到半行
 function Scroll-By([int]$rows) {
@@ -1179,8 +1240,7 @@ function Scroll-To([int]$row) {
 }
 
 # 一次滚两行：行高 74px，滚一行太黏手，滚三行又容易翻过头
-function Bind-Wheel($ctrl) {
-    $ctrl.Add_MouseWheel({
+function Bind-Wheel($ctrl) {    $ctrl.Add_MouseWheel({
         param($s, $e)
         $n = [int][math]::Round($e.Delta / 120.0) * 2
         if ($n -eq 0) { $n = $(if ($e.Delta -gt 0) { 2 } else { -2 }) }
@@ -1203,26 +1263,22 @@ function Layout-UI {
     # 空态给一个固定高度，否则窗口会塌成只剩顶栏的一条细缝
     if ($script:Stocks.Count -eq 0) { $fullH = Px 64 }
 
-    # 高度封顶：内容超过屏幕工作区 60% 就不再拉高窗口，改成列表内部滚动。
-    # 屏幕高度用物理像素，不乘 Scale —— 屏幕就这么大，缩放再大也不该顶出屏外；
-    # 下限保 4 行，免得在缩放很大时一屏只剩一两行。
-    $capBody = 0
-    if ($script:CapHeight) {
+    # 一屏行数：按「只数」定，不再按屏幕比例。
+    # 默认 6 只，右键可选 2/4/6/8/10；选自动(0) 才回退到屏幕工作区 60% 折算。
+    $capRows = $script:RowsCap
+    if ($capRows -le 0) {
         $waH = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
         $capBody = [int]($waH * 0.60) - $HH
-        $minBody = (Px 10) + (4 * $blkH) + $chartH
-        if ($capBody -lt $minBody) { $capBody = $minBody }
+        $capRows = [int][math]::Floor(($capBody - (Px 10) - $chartH) / [double]$blkH)
+        if ($capRows -lt 1) { $capRows = 1 }
     }
+    $capBody = (Px 10) + ($capRows * $blkH) + $chartH
 
     $BodyH = $fullH
     $script:Scrollable = $false
-    if ($capBody -gt 0 -and $fullH -gt $capBody) {
+    if ($fullH -gt $capBody) {
         $script:Scrollable = $true
-        # 只在整行处切断：capBody 一般是 595 这种非行高整数倍的数，
-        # 直接用它会在底部留一条几十像素的空白，看着像没画完
-        $n = [int][math]::Floor(($capBody - (Px 10) - $chartH) / [double]$blkH)
-        if ($n -lt 1) { $n = 1 }
-        $BodyH = (Px 10) + ($n * $blkH) + $chartH
+        $BodyH = $capBody
     }
 
     # 一屏能放几行（分时图钉在底部，先把它的高度扣掉），再把 TopRow 夹回合法范围
@@ -1366,8 +1422,19 @@ function Layout-UI {
     # 必须在这里强制同步重绘一次，按钮才不会“等鼠标移上去才恢复”。
     $form.Invalidate($true)
     $form.Update()
-    # 展开/收起分时时窗口会变高，分层窗口（Opacity<1）对新增区域不保证补画，
-    # 那块会一直透出桌面，直到别的事件触发重绘 —— 这里直接让分时面板立即重画一次
+    # 高度变了（展开分时、加删股票、滚动到底）时窗口会变高/变矮，分层窗口
+    # （Opacity<1）对新增区域不保证补画，那块会一直透出桌面 —— 尺寸变化时整窗刷一次。
+    # 只在高度变化时做，拖手柄连续缩放时不会因此掉帧。
+    if ($H -ne $script:LastH) {
+        $script:LastH = $H
+        # 分层窗口（Opacity<1）改变大小后，DWM 不会自动补画新增区域，那块会一直透出
+        # 桌面。微调一次 Opacity 会强制重建分层表面，把整窗重新合成一遍。
+        if ($script:Alpha -lt 1.0) {
+            $form.Opacity = [math]::Min(1.0, $script:Alpha + 0.004)
+            $form.Opacity = $script:Alpha
+        }
+        $form.Refresh()
+    }
     if ($null -ne $script:Chart -and $script:Chart.Visible) { $script:Chart.Refresh() }
 }
 
@@ -1431,7 +1498,7 @@ function Save-Pos {
             Theme = $script:Theme
             Alpha = $script:Alpha
             Rate  = $(if ($script:RateMode -eq "auto") { "auto" } else { [string]$script:RateMs })
-            Cap   = $script:CapHeight
+            Rows  = $script:RowsCap
         }
         $o | ConvertTo-Json -Compress | Out-File -FilePath $PosFile -Encoding ascii -Force
     } catch { }
@@ -1732,8 +1799,13 @@ if (Test-Path $PosFile) {
                 }
             }
         }
-        if ($saved.PSObject.Properties.Name -contains "Cap") {
-            $script:CapHeight = [bool]$saved.Cap
+        $rn = -1
+        if (($saved.PSObject.Properties.Name -contains "Rows") -and [int]::TryParse([string]$saved.Rows, [ref]$rn)) {
+            if ($rn -ge 0) { $script:RowsCap = $rn }
+        }
+        # 老配置只有 Cap 布尔值：关着就当自动，开着沿用默认 6 只
+        elseif ($saved.PSObject.Properties.Name -contains "Cap") {
+            if (-not [bool]$saved.Cap) { $script:RowsCap = 0 } else { $script:RowsCap = 6 }
         }
         $sx = [int]$saved.X; $sy = [int]$saved.Y
         if ($sx -gt ($wa.Left - 50) -and $sx -lt ($wa.Right - 60) -and $sy -gt ($wa.Top - 10) -and $sy -lt ($wa.Bottom - 60)) {
@@ -1768,7 +1840,6 @@ Apply-Rate
 $form.Add_Shown({
     Set-Theme $script:Theme
     Fetch-Quotes -Force
-    Write-Log ("bounds=" + $form.Bounds.ToString() + " dpi=" + $script:Dpi)
 })
 
 [System.Windows.Forms.Application]::Run($form)
