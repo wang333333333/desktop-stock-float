@@ -81,6 +81,17 @@ $script:MinAt      = @{}     # code -> 上次拉分时的时刻
 $script:MinFail    = 0       # 分时连续失败次数，用于退避
 $script:Chart      = $null
 
+# 列表滚动：股票多了不可能一直往下加长窗口，超出行数后改为内部滚动
+$script:CapHeight  = $true   # 高度封顶开关（右键菜单可关，关掉就是老行为：全部铺开）
+$script:TopRow     = 0       # 首个可见行的索引
+$script:VisRows    = 99      # 当前一屏能放下的行数
+$script:MaxTopRow  = 0       # TopRow 的上限（= 总数 - 一屏行数）
+$script:Scrollable = $false  # 本帧是否需要滚动
+$script:ScrollBar  = $null
+$script:SbDrag     = $false
+$script:SbY        = 0
+$script:SbRow      = 0
+
 $script:ScaleMin = 0.70
 $script:ScaleMax = 1.80
 
@@ -317,6 +328,9 @@ $chart.Add_Paint({
     $c = $script:C
     $w = [single]$s.Width
     $h = [single]$s.Height
+    # 窗体带 Opacity（分层窗口）时，尺寸刚变过的区域系统不一定补背景，
+    # 会露出桌面；自绘面板自己刷底色最稳
+    $g.Clear($c.Bg)
     if ($w -lt (Px 40) -or $h -lt (Px 28)) { return }
 
     $penTop = New-Object System.Drawing.Pen($c.Line, 1)
@@ -459,6 +473,48 @@ $chart.Add_Paint({
 
     $brSub.Dispose()
     $penTop.Dispose()
+})
+
+# ---------- 滚动条（列表超出一屏时才出现，只占右侧 9px，不挤压内容） ----------
+$sbar = New-Object System.Windows.Forms.Panel
+$sbar.BackColor = $script:C.Bg
+$sbar.Visible   = $false
+Set-DoubleBuffered $sbar
+$body.Controls.Add($sbar)
+$script:ScrollBar = $sbar
+
+$sbar.Add_Paint({
+    param($s, $e)
+    $total = $script:Stocks.Count
+    if ($total -le 0) { return }
+    $g = $e.Graphics
+    $c = $script:C
+    $w = [single]$s.Width
+    $h = [single]$s.Height
+    $g.Clear($c.Bg)
+    if ($w -lt 2 -or $h -lt 8) { return }
+
+    # 轨道淡到几乎看不见，滑块才是主角（细条 + 深色主题下也够亮）
+    $tw = [single](Px 5)
+    if ($tw -gt ($w - 1)) { $tw = [single]($w - 1) }
+    $tx = [single](($w - $tw) / 2.0)
+
+    $colTrack = [System.Drawing.Color]::FromArgb(46, $c.Sub)
+    $brTrack = New-Object System.Drawing.SolidBrush($colTrack)
+    $g.FillRectangle($brTrack, $tx, [single]0, $tw, $h)
+    $brTrack.Dispose()
+
+    # 滑块长度按「一屏行数 / 总行数」等比，最短 Px 30，不然短到看不见
+    $th = [single]($h * [double]$script:VisRows / [double]$total)
+    if ($th -lt (Px 30)) { $th = [single](Px 30) }
+    if ($th -gt $h) { $th = $h }
+    $ratio = 0.0
+    if ($script:MaxTopRow -gt 0) { $ratio = $script:TopRow / [double]$script:MaxTopRow }
+    $ty = [single](($h - $th) * $ratio)
+
+    $brThumb = New-Object System.Drawing.SolidBrush($c.Sub)
+    $g.FillRectangle($brThumb, $tx, $ty, $tw, $th)
+    $brThumb.Dispose()
 })
 
 # ---------- 缩放手柄 ----------
@@ -814,6 +870,9 @@ function Add-Stock {
 
     $script:Stocks = @($script:Stocks) + @(@{ Code = $res.Code })
     Save-Watch
+    # 列表超过一屏时，新增的这只在最底下；先置一个超大值，Layout-UI 会夹到最后一屏，
+    # 这样加完马上就能看见它，不用自己往下滚
+    $script:TopRow = 9999
     Build-Rows
     Layout-UI
     Clamp-Bounds
@@ -918,6 +977,20 @@ function New-Menu([string]$code) {
     }
     [void]$m.Items.Add($miRate)
 
+    # 关掉就是老行为：有多少只就铺多高。默认开着，股票加多了也不会顶出屏幕
+    $miCap = [System.Windows.Forms.ToolStripMenuItem]::new("高度封顶（超出一屏可滚动）")
+    $miCap.Name = "miCap"
+    $miCap.CheckOnClick = $false
+    $miCap.ShowCheckMargin = $true
+    $miCap.Add_Click({
+        $script:CapHeight = -not $script:CapHeight
+        $script:TopRow = 0
+        Layout-UI
+        Clamp-Bounds
+        Save-Pos
+    })
+    [void]$m.Items.Add($miCap)
+
     $m.Add_Opening({
         $curScale = [int][Math]::Round($script:Scale * 100)
         $curAlpha = [int][Math]::Round($script:Alpha * 100)
@@ -936,6 +1009,9 @@ function New-Menu([string]$code) {
                     if ([string]$cc.Tag -eq "auto") { $cc.Checked = ($script:RateMode -eq "auto") }
                     else { $cc.Checked = ($script:RateMode -eq "manual" -and [int]$cc.Tag -eq $script:RateMs) }
                 }
+            }
+            elseif ($x.Name -eq "miCap") {
+                $x.Checked = $script:CapHeight
             }
         }
     })
@@ -1049,6 +1125,7 @@ function Build-Rows {
             # 单击整行 → 展开 / 收起该股当日分时；拖动窗口不会误触（MouseUp 时已不在原控件上）
             $ctl.Add_Click({ Toggle-Chart ([string]$this.Tag) })
             Bind-Drag $ctl
+            Bind-Wheel $ctl
         }
         $script:UI += $row
     }
@@ -1080,6 +1157,37 @@ function Build-Rows {
     }
 }
 
+# ---------- 滚动 ----------
+# 滚动单位是「行」而不是像素：行高会随缩放变，按行走才不会滚到半行
+function Scroll-By([int]$rows) {
+    if (-not $script:Scrollable) { return }
+    $t = $script:TopRow + $rows
+    if ($t -lt 0) { $t = 0 }
+    if ($t -gt $script:MaxTopRow) { $t = $script:MaxTopRow }
+    if ($t -eq $script:TopRow) { return }
+    $script:TopRow = $t
+    Layout-UI
+}
+
+function Scroll-To([int]$row) {
+    if (-not $script:Scrollable) { return }
+    if ($row -lt 0) { $row = 0 }
+    if ($row -gt $script:MaxTopRow) { $row = $script:MaxTopRow }
+    if ($row -eq $script:TopRow) { return }
+    $script:TopRow = $row
+    Layout-UI
+}
+
+# 一次滚两行：行高 74px，滚一行太黏手，滚三行又容易翻过头
+function Bind-Wheel($ctrl) {
+    $ctrl.Add_MouseWheel({
+        param($s, $e)
+        $n = [int][math]::Round($e.Delta / 120.0) * 2
+        if ($n -eq 0) { $n = $(if ($e.Delta -gt 0) { 2 } else { -2 }) }
+        Scroll-By (-$n)
+    })
+}
+
 # ---------- 布局 ----------
 function Layout-UI {
     $s = $script:Scale
@@ -1090,9 +1198,45 @@ function Layout-UI {
     $blkH  = Px 74
     $chartH = 0
     if ($script:ChartCode -and $script:Stocks.Count -gt 0) { $chartH = Px 94 }
-    $BodyH = (Px 10) + ($script:Stocks.Count * $blkH) + $chartH
+
+    $fullH = (Px 10) + ($script:Stocks.Count * $blkH) + $chartH
     # 空态给一个固定高度，否则窗口会塌成只剩顶栏的一条细缝
-    if ($script:Stocks.Count -eq 0) { $BodyH = Px 64 }
+    if ($script:Stocks.Count -eq 0) { $fullH = Px 64 }
+
+    # 高度封顶：内容超过屏幕工作区 60% 就不再拉高窗口，改成列表内部滚动。
+    # 屏幕高度用物理像素，不乘 Scale —— 屏幕就这么大，缩放再大也不该顶出屏外；
+    # 下限保 4 行，免得在缩放很大时一屏只剩一两行。
+    $capBody = 0
+    if ($script:CapHeight) {
+        $waH = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
+        $capBody = [int]($waH * 0.60) - $HH
+        $minBody = (Px 10) + (4 * $blkH) + $chartH
+        if ($capBody -lt $minBody) { $capBody = $minBody }
+    }
+
+    $BodyH = $fullH
+    $script:Scrollable = $false
+    if ($capBody -gt 0 -and $fullH -gt $capBody) {
+        $script:Scrollable = $true
+        # 只在整行处切断：capBody 一般是 595 这种非行高整数倍的数，
+        # 直接用它会在底部留一条几十像素的空白，看着像没画完
+        $n = [int][math]::Floor(($capBody - (Px 10) - $chartH) / [double]$blkH)
+        if ($n -lt 1) { $n = 1 }
+        $BodyH = (Px 10) + ($n * $blkH) + $chartH
+    }
+
+    # 一屏能放几行（分时图钉在底部，先把它的高度扣掉），再把 TopRow 夹回合法范围
+    $listH   = $BodyH - (Px 10) - $chartH
+    $visRows = [int][math]::Floor($listH / [double]$blkH)
+    if ($visRows -lt 1) { $visRows = 1 }
+    if ($visRows -gt $script:Stocks.Count) { $visRows = $script:Stocks.Count }
+    $maxTop = $script:Stocks.Count - $visRows
+    if ($maxTop -lt 0) { $maxTop = 0 }
+    if ($script:TopRow -gt $maxTop) { $script:TopRow = $maxTop }
+    if ($script:TopRow -lt 0) { $script:TopRow = 0 }
+    $script:VisRows   = [math]::Max(1, $visRows)
+    $script:MaxTopRow = $maxTop
+
     $H     = $HH + $BodyH
 
     $form.ClientSize = [System.Drawing.Size]::new($W, $H)
@@ -1145,6 +1289,20 @@ function Layout-UI {
         }
     }
 
+    if ($null -ne $script:ScrollBar) {
+        if ($script:Scrollable) {
+            $sbW = Px 9
+            $script:ScrollBar.BackColor = $script:C.Bg
+            $script:ScrollBar.Location  = [System.Drawing.Point]::new(($W - $sbW), 0)
+            $script:ScrollBar.Size      = [System.Drawing.Size]::new($sbW, ($BodyH - $chartH))
+            $script:ScrollBar.Visible   = $true
+            $script:ScrollBar.BringToFront()
+            $script:ScrollBar.Invalidate()
+        } else {
+            $script:ScrollBar.Visible = $false
+        }
+    }
+
     $fName  = Get-Font (9 * $s) 'normal'
     $fPct   = Get-Font (9.5 * $s) 'bold'
     $fPrice = Get-Font (17 * $s) 'bold'
@@ -1155,7 +1313,13 @@ function Layout-UI {
 
     for ($i = 0; $i -lt $script:Stocks.Count; $i++) {
         $u   = $script:UI[$i]
-        $top = (Px 8) + ($i * $blkH)
+        # 滚动就是整体往上挪 TopRow 行的距离；超出 body 的部分由父容器自然裁掉
+        $top = (Px 8) + (($i - $script:TopRow) * $blkH)
+        $vis = ($i -ge $script:TopRow -and $i -lt ($script:TopRow + $script:VisRows))
+
+        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) {
+            if ($u.$k.Visible -ne $vis) { $u.$k.Visible = $vis }
+        }
 
         $u.Name.Font  = $fName
         $u.Name.Location = [System.Drawing.Point]::new((Px 12), $top)
@@ -1178,6 +1342,7 @@ function Layout-UI {
         $u.Info.Size     = [System.Drawing.Size]::new(($W - (Px 24)), (Px 15))
 
         if ($i -lt $script:Seps.Count) {
+            if ($script:Seps[$i].Visible -ne $vis) { $script:Seps[$i].Visible = $vis }
             $script:Seps[$i].Location = [System.Drawing.Point]::new((Px 12), (($top + $blkH) - (Px 8)))
             $script:Seps[$i].Size     = [System.Drawing.Size]::new(($W - (Px 24)), 1)
         }
@@ -1201,6 +1366,9 @@ function Layout-UI {
     # 必须在这里强制同步重绘一次，按钮才不会“等鼠标移上去才恢复”。
     $form.Invalidate($true)
     $form.Update()
+    # 展开/收起分时时窗口会变高，分层窗口（Opacity<1）对新增区域不保证补画，
+    # 那块会一直透出桌面，直到别的事件触发重绘 —— 这里直接让分时面板立即重画一次
+    if ($null -ne $script:Chart -and $script:Chart.Visible) { $script:Chart.Refresh() }
 }
 
 # ---------- 主题按钮 ----------
@@ -1228,6 +1396,7 @@ function Set-Theme([string]$name) {
     $body.BackColor   = $t.Bg
     $grip.BackColor   = $t.Bg
     if ($null -ne $script:Chart) { $script:Chart.BackColor = $t.Bg }
+    if ($null -ne $script:ScrollBar) { $script:ScrollBar.BackColor = $t.Bg; $script:ScrollBar.Invalidate() }
 
     $lblStatus.BackColor = $t.Head
     $lblStatus.ForeColor = $t.Sub
@@ -1262,6 +1431,7 @@ function Save-Pos {
             Theme = $script:Theme
             Alpha = $script:Alpha
             Rate  = $(if ($script:RateMode -eq "auto") { "auto" } else { [string]$script:RateMs })
+            Cap   = $script:CapHeight
         }
         $o | ConvertTo-Json -Compress | Out-File -FilePath $PosFile -Encoding ascii -Force
     } catch { }
@@ -1460,9 +1630,79 @@ $grip.Add_MouseUp({
 
 foreach ($ctrl in @($header, $lblStatus, $body)) { Bind-Drag $ctrl }
 
+# ---------- 滚动：滚轮 / 滚动条 / 键盘 ----------
+# 滚轮消息只发给「光标下的控件」或焦点控件，所以能滚到的控件都接一遍，
+# 鼠标停在顶栏、行、分时图上都能翻列表，不用先精确对准某个区域
+foreach ($wctl in @($form, $header, $lblStatus, $body, $script:Chart, $script:ScrollBar)) {
+    if ($null -ne $wctl) { Bind-Wheel $wctl }
+}
+
+$script:ScrollBar.Add_MouseDown({
+    param($s, $e)
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    if (-not $script:Scrollable -or $script:Stocks.Count -le 0) { return }
+    $h = [double]$this.Height
+    if ($h -le 0) { return }
+
+    # 重新算一遍滑块位置：命中滑块就拖，命中轨道就把滑块的「中心」挪到点击处
+    $th = $h * [double]$script:VisRows / [double]$script:Stocks.Count
+    if ($th -lt (Px 24)) { $th = [double](Px 24) }
+    if ($th -gt $h) { $th = $h }
+    $ratio = 0.0
+    if ($script:MaxTopRow -gt 0) { $ratio = $script:TopRow / [double]$script:MaxTopRow }
+    $ty = ($h - $th) * $ratio
+    $y  = [double]$e.Y
+
+    if ($y -lt $ty -or $y -gt ($ty + $th)) {
+        $span = $h - $th
+        if ($span -ge 1 -and $script:MaxTopRow -gt 0) {
+            $r = ($y - $th / 2.0) / $span
+            if ($r -lt 0) { $r = 0 }
+            if ($r -gt 1) { $r = 1 }
+            Scroll-To ([int][math]::Round($r * $script:MaxTopRow))
+        }
+        return
+    }
+
+    $script:SbDrag = $true
+    $script:SbY    = [System.Windows.Forms.Cursor]::Position.Y
+    $script:SbRow  = $script:TopRow
+})
+
+$script:ScrollBar.Add_MouseMove({
+    param($s, $e)
+    if (-not $script:SbDrag) { return }
+    $h = [double]$this.Height
+    $rows = $script:Stocks.Count - $script:VisRows
+    if ($h -le 0 -or $rows -le 0) { return }
+
+    $th = $h * [double]$script:VisRows / [double]$script:Stocks.Count
+    if ($th -lt (Px 24)) { $th = [double](Px 24) }
+    $span = $h - $th
+    if ($span -lt 1) { return }
+
+    # 鼠标每滑过 span/rows 像素 = 一行，和滑块长度完全同步
+    $dy = [System.Windows.Forms.Cursor]::Position.Y - $script:SbY
+    Scroll-To ($script:SbRow + [int][math]::Round($dy / $span * $rows))
+})
+
+$script:ScrollBar.Add_MouseUp({ $script:SbDrag = $false })
+# 在窗口外松手也要复位，否则滑块会一直跟着鼠标
+$form.Add_MouseUp({ $script:SbDrag = $false })
+
+$form.Add_KeyDown({
+    param($s, $e)
+    $k = $e.KeyCode
+    if ($k -eq [System.Windows.Forms.Keys]::PageDown) { Scroll-By $script:VisRows; $e.Handled = $true }
+    elseif ($k -eq [System.Windows.Forms.Keys]::PageUp) { Scroll-By (-$script:VisRows); $e.Handled = $true }
+    elseif ($k -eq [System.Windows.Forms.Keys]::Home)   { Scroll-To 0; $e.Handled = $true }
+    elseif ($k -eq [System.Windows.Forms.Keys]::End)    { Scroll-To 9999; $e.Handled = $true }
+})
+
 $form.ContextMenuStrip = New-Menu $null
 $header.ContextMenuStrip = $form.ContextMenuStrip
 $body.ContextMenuStrip = $form.ContextMenuStrip
+$script:ScrollBar.ContextMenuStrip = $form.ContextMenuStrip
 
 # ---------- 读取上次的位置 / 缩放 / 主题 ----------
 $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -1491,6 +1731,9 @@ if (Test-Path $PosFile) {
                     if ($n -gt 0) { $script:RateMode = "manual"; $script:RateMs = $n }
                 }
             }
+        }
+        if ($saved.PSObject.Properties.Name -contains "Cap") {
+            $script:CapHeight = [bool]$saved.Cap
         }
         $sx = [int]$saved.X; $sy = [int]$saved.Y
         if ($sx -gt ($wa.Left - 50) -and $sx -lt ($wa.Right - 60) -and $sy -gt ($wa.Top - 10) -and $sy -lt ($wa.Bottom - 60)) {
