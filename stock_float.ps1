@@ -76,8 +76,9 @@ $script:RsY        = 0
 $script:RsH        = 184
 $script:DlgOut     = $null
 $script:ChartCode  = ""      # 当前展开分时的代码，空 = 收起
-$script:Mins       = @{}     # code -> 分时点（T 时间 / P 价 / I 槽位 0..240）
+$script:Mins       = @{}     # code -> 分时点（T 时间 / P 价 / I 槽位 0..240 / A 均价）
 $script:MinAt      = @{}     # code -> 上次拉分时的时刻
+$script:MinFail    = 0       # 分时连续失败次数，用于退避
 $script:Chart      = $null
 
 $script:ScaleMin = 0.70
@@ -95,6 +96,7 @@ $Themes = @{
         Down  = [System.Drawing.Color]::FromArgb(45, 208, 128)
         Flat  = [System.Drawing.Color]::FromArgb(200, 206, 216)
         Ok    = [System.Drawing.Color]::FromArgb(72, 222, 148)
+        Avg   = [System.Drawing.Color]::FromArgb(226, 176, 74)
         Pick  = [System.Drawing.Color]::FromArgb(14, 16, 20)
     }
     light = @{
@@ -107,6 +109,7 @@ $Themes = @{
         Down  = [System.Drawing.Color]::FromArgb(12, 150, 84)
         Flat  = [System.Drawing.Color]::FromArgb(31, 35, 40)
         Ok    = [System.Drawing.Color]::FromArgb(8, 122, 64)
+        Avg   = [System.Drawing.Color]::FromArgb(191, 133, 20)
         Pick  = [System.Drawing.Color]::FromArgb(211, 220, 234)
     }
 }
@@ -334,11 +337,21 @@ $chart.Add_Paint({
         return
     }
 
+    # 右下角常驻缩放手柄（Px 15 见方），绘图区右侧让出这一块，
+    # 否则手柄会压住折线末端和 15:00 刻度
+    $gw = Px 15
     $lx = Px 8
-    $rx = $w - (Px 8)
+    $rx = $w - $gw - (Px 3)
     $ty = Px 7
-    $by = $h - (Px 13)
-    if ($by -le ($ty + 4)) { $by = $h - 2; $ty = 2 }
+
+    # 底部刻度行按字体实际高度顶到面板底边，不再用固定 12px 猜，
+    # 否则 7pt 的行高会把字的下缘挤出面板被裁掉
+    $fAx   = Get-Font (7 * $script:Scale) 'normal'
+    $axH   = [single]($g.MeasureString("09:30", $fAx).Height)
+    $yAx   = [single]($h - $axH - (Px 1))
+    $showAx = ($h -ge (Px 52))
+    if ($showAx) { $by = [single]($yAx - (Px 2)) } else { $by = [single]($h - (Px 3)) }
+    if ($by -le ($ty + 4)) { $by = [single]($h - 2); $ty = [single]2 }
 
     $prev = 0.0
     if ($null -ne $d) { $prev = [double]$d.Prev }
@@ -374,7 +387,9 @@ $chart.Add_Paint({
         $pDash.Dispose()
     }
 
-    $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    $pts  = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    $apts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    $lastAvg = 0.0
     foreach ($pt in $arr) {
         if ($pt.P -le 0) { continue }
         $ix = [double]$pt.I / 240.0
@@ -383,6 +398,11 @@ $chart.Add_Paint({
         $px = $lx + $ix * ($rx - $lx)
         $py = $ty + ($hi - $pt.P) / $span * ($by - $ty)
         $pts.Add([System.Drawing.PointF]::new([single]$px, [single]$py))
+        if ($pt.A -gt 0) {
+            $lastAvg = [double]$pt.A
+            $ay = $ty + ($hi - $pt.A) / $span * ($by - $ty)
+            $apts.Add([System.Drawing.PointF]::new([single]$px, [single]$ay))
+        }
     }
 
     if ($pts.Count -ge 2) {
@@ -401,6 +421,13 @@ $chart.Add_Paint({
         $g.FillPath($brFill, $fill)
         $brFill.Dispose(); $fill.Dispose()
 
+        # 均价线压在价格线下面，避免抢主线
+        if ($apts.Count -ge 2) {
+            $penAvg = New-Object System.Drawing.Pen($c.Avg, [single][math]::Max(1.0, 1.0 * $script:Scale))
+            $g.DrawLines($penAvg, $apts.ToArray())
+            $penAvg.Dispose()
+        }
+
         $penLine = New-Object System.Drawing.Pen($col, [single][math]::Max(1.2, 1.3 * $script:Scale))
         $g.DrawLines($penLine, $pa)
         $penLine.Dispose()
@@ -411,11 +438,23 @@ $chart.Add_Paint({
         $brDot.Dispose()
     }
 
-    if ($h -ge (Px 52)) {
-        $fAx = Get-Font (7 * $script:Scale) 'normal'
-        $g.DrawString("09:30", $fAx, $brSub, $lx, ($h - (Px 12)))
-        $sz = $g.MeasureString("15:00", $fAx)
-        $g.DrawString("15:00", $fAx, $brSub, [single]($rx - $sz.Width), [single]($h - (Px 12)))
+    if ($showAx) {
+        $sl  = $g.MeasureString("09:30", $fAx)
+        $g.DrawString("09:30", $fAx, $brSub, $lx, $yAx)
+        $sr2 = $g.MeasureString("15:00", $fAx)
+        $g.DrawString("15:00", $fAx, $brSub, [single]($rx - $sr2.Width), [single]$yAx)
+
+        # 均价读数放在两个刻度中间，窄窗口挤不下就不画
+        if ($lastAvg -gt 0) {
+            $tAvg = "均价 {0:F2}" -f $lastAvg
+            $sm   = $g.MeasureString($tAvg, $fAx)
+            $xm   = $lx + (($rx - $lx) - $sm.Width) / 2.0
+            if ($xm -gt ($lx + $sl.Width + 4) -and ($xm + $sm.Width) -lt ($rx - $sr2.Width - 4)) {
+                $brAvg = New-Object System.Drawing.SolidBrush($c.Avg)
+                $g.DrawString($tAvg, $fAx, $brAvg, [single]$xm, [single]$yAx)
+                $brAvg.Dispose()
+            }
+        }
     }
 
     $brSub.Dispose()
@@ -516,7 +555,8 @@ function Request-Quotes([string]$codes) {
 
 # ---------- 分时数据 ----------
 # 接口：https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh601088
-# 每行格式 "HHmm 价格 累计量 累计额"，一整天 240 个槽位（09:30-11:30、13:00-15:00）
+# 每行格式 "HHmm 价格 累计量(手) 累计额(元)"，一整天 240 个槽位（09:30-11:30、13:00-15:00）
+# A = 当日均价（累计额 ÷ 累计股数），即分时图上的黄色均价线
 function Request-Minutes([string]$code) {
     $out = @()
     if (-not $code) { return $out }
@@ -527,7 +567,8 @@ function Request-Minutes([string]$code) {
         $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         $req.Timeout = 3000
         $req.ReadWriteTimeout = 3000
-        $req.KeepAlive = $false
+        # 复用连接：首包做一次 TLS 握手（约 200ms），之后每秒一次只要 30ms 左右
+        $req.KeepAlive = $true
         $resp = $req.GetResponse()
         $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
         $txt = $sr.ReadToEnd()
@@ -552,24 +593,38 @@ function Request-Minutes([string]$code) {
             if ($mins -le 690) { $idx = $mins - 570 } else { $idx = 120 + ($mins - 780) }
             if ($idx -lt 0) { $idx = 0 }
             if ($idx -gt 240) { $idx = 240 }
-            $out += [pscustomobject]@{ T = $t; P = $v; I = $idx }
+            # 均价 = 累计成交额 / (累计成交量 × 100)，量单位是手
+            $avg = 0.0
+            if ($p.Count -ge 4) {
+                $vol = 0.0; $amt = 0.0
+                if ([double]::TryParse($p[2], [ref]$vol) -and [double]::TryParse($p[3], [ref]$amt) -and $vol -gt 0) {
+                    $avg = $amt / ($vol * 100.0)
+                }
+            }
+            $out += [pscustomobject]@{ T = $t; P = $v; I = $idx; A = $avg }
         }
     } catch { }
     return $out
 }
 
-# 拉取频控：同一次展开最多 15 秒一次，避免分时数据把请求量翻倍
+# 刷新节奏与报价一致（盘中 1 秒），这样分时末尾才不会落后于上方价格；
+# 连续失败才退避到 3 秒，避免网络抖动时每秒硬撞
 function Load-Minutes([string]$code, [switch]$Force) {
     if (-not $code) { return }
     $now = Get-Date
     if (-not $Force) {
         $last = $script:MinAt[$code]
-        if ($null -ne $last -and ($now - $last).TotalSeconds -lt 15) { return }
+        $gap  = 0.5
+        if ($script:MinFail -gt 0) { $gap = 3.0 }
+        if ($null -ne $last -and ($now - $last).TotalSeconds -lt $gap) { return }
     }
     $arr = @(Request-Minutes $code)
+    $script:MinAt[$code] = $now
     if ($arr.Count -gt 0) {
-        $script:Mins[$code]  = $arr
-        $script:MinAt[$code] = $now
+        $script:Mins[$code] = $arr
+        $script:MinFail = 0
+    } elseif ($script:MinFail -lt 9) {
+        $script:MinFail++
     }
     if ($null -ne $script:Chart -and $script:ChartCode -eq $code) { $script:Chart.Invalidate() }
 }
@@ -1034,7 +1089,7 @@ function Layout-UI {
     $HH    = [math]::Max((Px 29), 24)
     $blkH  = Px 74
     $chartH = 0
-    if ($script:ChartCode -and $script:Stocks.Count -gt 0) { $chartH = Px 86 }
+    if ($script:ChartCode -and $script:Stocks.Count -gt 0) { $chartH = Px 94 }
     $BodyH = (Px 10) + ($script:Stocks.Count * $blkH) + $chartH
     # 空态给一个固定高度，否则窗口会塌成只剩顶栏的一条细缝
     if ($script:Stocks.Count -eq 0) { $BodyH = Px 64 }
@@ -1356,7 +1411,7 @@ function Render {
     if ($sess -eq "am" -or $sess -eq "pm") { $script:AutoMs = 1000 } else { $script:AutoMs = 30000 }
     Apply-Rate
 
-    # 分时图展开时跟一次（内部 15 秒频控，不会把请求量翻倍）
+    # 分时图展开时跟着报价一起刷新（同为盘中 1 秒），末尾才不会比上方价格慢一拍
     if ($script:ChartCode) { Load-Minutes $script:ChartCode }
 }
 
