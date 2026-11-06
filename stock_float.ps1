@@ -21,6 +21,31 @@ public class DpiFix {
     [void][DpiFix]::SetProcessDPIAware()
 } catch { }
 
+# ---------- 缩放预览框（橡皮筋） ----------
+# 拖手柄时不再实时改窗口尺寸：分层窗口（Opacity<1）每改一次尺寸就要重建一次
+# 合成表面，新区域还没来得及填色就被 DWM 合成，表现为右侧/底部一整块纯黑。
+# 改成拖动期间只画一个 XOR 虚线框，松手才真正应用尺寸 —— 窗口一次都不重建，不会黑。
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class Rubber {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("user32.dll")] private static extern bool DrawFocusRect(IntPtr dc, ref RECT r);
+    // DrawFocusRect 用 XOR，同一矩形画两次即擦除
+    public static void Draw(int l, int t, int r, int b) {
+        IntPtr dc = GetDC(IntPtr.Zero);
+        RECT rc; rc.Left = l; rc.Top = t; rc.Right = r; rc.Bottom = b;
+        DrawFocusRect(dc, ref rc);
+        ReleaseDC(IntPtr.Zero, dc);
+    }
+}
+'@ -ErrorAction Stop
+} catch { }
+
 # ---------- 单例 ----------
 $script:Mutex = New-Object System.Threading.Mutex($false, "Global\FloatQuoteWidget_v1")
 if (-not $script:Mutex.WaitOne(0)) { exit }
@@ -74,6 +99,10 @@ $script:Resizing   = $false
 $script:RsFrom     = 1.0
 $script:RsY        = 0
 $script:RsH        = 184
+$script:RsW0       = 0       # 按下手柄那一刻的窗口宽高，用于按比例算预览框
+$script:RsH0       = 0
+$script:RsBox      = $null   # 屏幕上正在显示的虚线预览框（l/t/r/b），$null = 没画
+$script:RsScale    = 1.0     # 拖动中的目标缩放值，松手才真正应用
 $script:DlgOut     = $null
 $script:ChartCode  = ""      # 当前展开分时的代码，空 = 收起
 $script:Mins       = @{}     # code -> 分时点（T 时间 / P 价 / I 槽位 0..240 / A 均价）
@@ -96,6 +125,8 @@ $script:SbRow      = 0
 
 $script:ScaleMin = 0.70
 $script:ScaleMax = 1.80
+$script:HudTimer = $null    # 状态栏临时提示（Ctrl+滚轮缩放比例）的回收定时器
+$script:WheelAt  = [datetime]::MinValue   # 上一次处理的滚轮时刻，用于干掉冒泡产生的重复消息
 
 # ---------- 主题 ----------
 $Themes = @{
@@ -1175,7 +1206,6 @@ function Build-Rows {
             # 单击整行 → 展开 / 收起该股当日分时；拖动窗口不会误触（MouseUp 时已不在原控件上）
             $ctl.Add_Click({ Toggle-Chart ([string]$this.Tag) })
             Bind-Drag $ctl
-            Bind-Wheel $ctl
         }
         $script:UI += $row
     }
@@ -1239,9 +1269,50 @@ function Scroll-To([int]$row) {
     Layout-UI
 }
 
+# Ctrl+滚轮 档位缩放：每档 5%，钳在 70%~180%
+# 和拖手柄不同的地方：一档只改一次尺寸，最多闪 1 帧（30ms），肉眼看不出来
+function Step-Scale([int]$dir) {
+    $ns = [math]::Round($script:Scale + 0.05 * $dir, 2)
+    if ($ns -lt $script:ScaleMin) { $ns = $script:ScaleMin }
+    if ($ns -gt $script:ScaleMax) { $ns = $script:ScaleMax }
+    if ([math]::Abs($ns - $script:Scale) -lt 0.001) { return }
+    $script:Scale = $ns
+    Layout-UI
+    Clamp-Bounds
+    Save-Pos
+    Show-Hud (([string][int][math]::Round($ns * 100)) + "%")
+}
+
+# 状态栏临时提示：1.2 秒后自动回到时段文案
+function Show-Hud([string]$text) {
+    if ($null -eq $script:LblStatus) { return }
+    $script:LblStatus.Text = $text
+    if ($null -eq $script:HudTimer) {
+        $script:HudTimer = New-Object System.Windows.Forms.Timer
+        $script:HudTimer.Interval = 1200
+        $script:HudTimer.Add_Tick({
+            $script:HudTimer.Stop()
+            Set-Status (Get-Session)
+        })
+    }
+    $script:HudTimer.Stop()
+    $script:HudTimer.Start()
+}
+
 # 一次滚两行：行高 74px，滚一行太黏手，滚三行又容易翻过头
-function Bind-Wheel($ctrl) {    $ctrl.Add_MouseWheel({
+# 按住 Ctrl 时改为档位缩放，普通滚轮仍然翻列表
+function Bind-Wheel($ctrl) {
+    $ctrl.Add_MouseWheel({
         param($s, $e)
+        # 保险：个别情况下同一次滚动会被投递两遍（20ms 内的重复只认第一次）
+        $now = [datetime]::Now
+        if (($now - $script:WheelAt).TotalMilliseconds -lt 20) { return }
+        $script:WheelAt = $now
+
+        if (([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Control) -ne 0) {
+            if ($e.Delta -gt 0) { Step-Scale 1 } else { Step-Scale -1 }
+            return
+        }
         $n = [int][math]::Round($e.Delta / 120.0) * 2
         if ($n -eq 0) { $n = $(if ($e.Delta -gt 0) { 2 } else { -2 }) }
         Scroll-By (-$n)
@@ -1664,45 +1735,69 @@ $btnClose.Add_Click({ $timer.Stop(); $script:Form.Close() })
 $btnClose.Add_MouseEnter({ $this.ForeColor = $script:C.Up }) | Out-Null
 $btnClose.Add_MouseLeave({ $this.ForeColor = $script:C.Sub }) | Out-Null
 
+# 缩放手柄：拖动时只画虚线预览框，松手才真正改尺寸。
+# 必须 Capture，否则鼠标一移出手柄就收不到 MouseMove，预览框会卡住。
 $grip.Add_MouseDown({
     param($s, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
         $script:Resizing = $true
         $script:RsFrom   = $script:Scale
+        $script:RsScale  = $script:Scale
         $script:RsY      = [System.Windows.Forms.Cursor]::Position.Y
         $script:RsH      = $script:Form.ClientSize.Height
+        $script:RsW0     = $script:Form.Width
+        $script:RsH0     = $script:Form.Height
+        $script:RsBox    = $null
+        $grip.Capture    = $true
     }
 })
 $grip.Add_MouseMove({
     param($s, $e)
-    if ($script:Resizing) {
-        $dy = [System.Windows.Forms.Cursor]::Position.Y - $script:RsY
-        $ns = $script:RsFrom * (($script:RsH + $dy) / $script:RsH)
-        if ($ns -lt $script:ScaleMin) { $ns = $script:ScaleMin }
-        if ($ns -gt $script:ScaleMax) { $ns = $script:ScaleMax }
-        $ns = [math]::Round($ns, 2)
-        if ([math]::Abs($ns - $script:Scale) -ge 0.02) {
-            $script:Scale = $ns
-            Layout-UI
-        }
+    if (-not $script:Resizing) { return }
+    $dy = [System.Windows.Forms.Cursor]::Position.Y - $script:RsY
+    $ns = $script:RsFrom * (($script:RsH + $dy) / $script:RsH)
+    if ($ns -lt $script:ScaleMin) { $ns = $script:ScaleMin }
+    if ($ns -gt $script:ScaleMax) { $ns = $script:ScaleMax }
+    $ns = [math]::Round($ns, 2)
+    $script:RsScale = $ns
+
+    # 旧框先擦（XOR 画同一矩形即消失）
+    if ($null -ne $script:RsBox) {
+        [Rubber]::Draw($script:RsBox[0], $script:RsBox[1], $script:RsBox[2], $script:RsBox[3])
     }
+    $ratio = $ns / $script:RsFrom
+    $bw = [int][math]::Round($script:RsW0 * $ratio)
+    $bh = [int][math]::Round($script:RsH0 * $ratio)
+    $l  = $script:Form.Left
+    $t  = $script:Form.Top
+    $script:RsBox = @($l, $t, ($l + $bw), ($t + $bh))
+    [Rubber]::Draw($script:RsBox[0], $script:RsBox[1], $script:RsBox[2], $script:RsBox[3])
 })
 $grip.Add_MouseUp({
     param($s, $e)
-    if ($script:Resizing) {
-        $script:Resizing = $false
-        Save-Pos
+    if (-not $script:Resizing) { return }
+    $script:Resizing = $false
+    $grip.Capture    = $false
+    if ($null -ne $script:RsBox) {
+        [Rubber]::Draw($script:RsBox[0], $script:RsBox[1], $script:RsBox[2], $script:RsBox[3])
+        $script:RsBox = $null
     }
+    # 松手这一刻才改尺寸：整个拖动过程窗口一次都没重建，不会闪黑
+    if ([math]::Abs($script:RsScale - $script:Scale) -ge 0.005) {
+        $script:Scale = $script:RsScale
+        Layout-UI
+        Clamp-Bounds
+    }
+    Save-Pos
 })
 
 foreach ($ctrl in @($header, $lblStatus, $body)) { Bind-Drag $ctrl }
 
 # ---------- 滚动：滚轮 / 滚动条 / 键盘 ----------
-# 滚轮消息只发给「光标下的控件」或焦点控件，所以能滚到的控件都接一遍，
-# 鼠标停在顶栏、行、分时图上都能翻列表，不用先精确对准某个区域
-foreach ($wctl in @($form, $header, $lblStatus, $body, $script:Chart, $script:ScrollBar)) {
-    if ($null -ne $wctl) { Bind-Wheel $wctl }
-}
+# 只绑 form 一个：WM_MOUSEWHEEL 由光标下的控件收下，没处理就会一路冒泡到父窗口，
+# 最终一定到 form。绑多个控件反而会让同一次滚动被处理两三遍（翻页翻两倍、
+# Ctrl+滚轮 一下跳两三档），所以这里只留最外层。
+Bind-Wheel $form
 
 $script:ScrollBar.Add_MouseDown({
     param($s, $e)
