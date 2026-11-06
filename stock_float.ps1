@@ -75,6 +75,10 @@ $script:RsFrom     = 1.0
 $script:RsY        = 0
 $script:RsH        = 184
 $script:DlgOut     = $null
+$script:ChartCode  = ""      # 当前展开分时的代码，空 = 收起
+$script:Mins       = @{}     # code -> 分时点（T 时间 / P 价 / I 槽位 0..240）
+$script:MinAt      = @{}     # code -> 上次拉分时的时刻
+$script:Chart      = $null
 
 $script:ScaleMin = 0.70
 $script:ScaleMax = 1.80
@@ -295,6 +299,129 @@ $body.BackColor = $script:C.Bg
 Set-DoubleBuffered $body
 $form.Controls.Add($body)
 
+# ---------- 分时图（点击某一行展开，收起时隐藏） ----------
+$chart = New-Object System.Windows.Forms.Panel
+$chart.BackColor = $script:C.Bg
+$chart.Visible   = $false
+Set-DoubleBuffered $chart
+$body.Controls.Add($chart)
+$script:Chart = $chart
+
+$chart.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $c = $script:C
+    $w = [single]$s.Width
+    $h = [single]$s.Height
+    if ($w -lt (Px 40) -or $h -lt (Px 28)) { return }
+
+    $penTop = New-Object System.Drawing.Pen($c.Line, 1)
+    $g.DrawLine($penTop, 0, 0, $w, 0)
+
+    $fTip  = Get-Font (7.5 * $script:Scale) 'normal'
+    $brSub = New-Object System.Drawing.SolidBrush($c.Sub)
+
+    $code = $script:ChartCode
+    $arr  = $null
+    if ($code -and $script:Mins.ContainsKey($code)) { $arr = $script:Mins[$code] }
+    $d = $null
+    if ($code) { $d = $script:State[$code] }
+
+    if ($null -eq $arr -or $arr.Count -lt 2) {
+        $g.DrawString("分时加载中…", $fTip, $brSub, (Px 10), ($h / 2 - (Px 8)))
+        $brSub.Dispose(); $penTop.Dispose()
+        return
+    }
+
+    $lx = Px 8
+    $rx = $w - (Px 8)
+    $ty = Px 7
+    $by = $h - (Px 13)
+    if ($by -le ($ty + 4)) { $by = $h - 2; $ty = 2 }
+
+    $prev = 0.0
+    if ($null -ne $d) { $prev = [double]$d.Prev }
+
+    $lo = [double]::MaxValue
+    $hi = [double]::MinValue
+    foreach ($pt in $arr) {
+        if ($pt.P -le 0) { continue }
+        if ($pt.P -lt $lo) { $lo = $pt.P }
+        if ($pt.P -gt $hi) { $hi = $pt.P }
+    }
+    if ($lo -gt $hi) { $lo = 0.0; $hi = 1.0 }
+    if ($prev -gt 0) {
+        # 以昨收为中轴对称定档，涨跌幅才直观（和常规分时图一致）
+        $amp = [Math]::Max([Math]::Abs($hi - $prev), [Math]::Abs($prev - $lo))
+        if ($amp -le 0.001) { $amp = 0.02 }
+        $amp = $amp * 1.15
+        $lo = $prev - $amp
+        $hi = $prev + $amp
+    } else {
+        $pad = ($hi - $lo) * 0.18
+        if ($pad -le 0.001) { $pad = 0.02 }
+        $lo -= $pad; $hi += $pad
+    }
+    $span = $hi - $lo
+
+    # 昨收虚线（灰度弱化，不抢主线）
+    if ($prev -gt 0) {
+        $py = $ty + ($hi - $prev) / $span * ($by - $ty)
+        $pDash = New-Object System.Drawing.Pen($c.Line, 1)
+        $pDash.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
+        $g.DrawLine($pDash, $lx, $py, $rx, $py)
+        $pDash.Dispose()
+    }
+
+    $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    foreach ($pt in $arr) {
+        if ($pt.P -le 0) { continue }
+        $ix = [double]$pt.I / 240.0
+        if ($ix -gt 1) { $ix = 1 }
+        if ($ix -lt 0) { $ix = 0 }
+        $px = $lx + $ix * ($rx - $lx)
+        $py = $ty + ($hi - $pt.P) / $span * ($by - $ty)
+        $pts.Add([System.Drawing.PointF]::new([single]$px, [single]$py))
+    }
+
+    if ($pts.Count -ge 2) {
+        $lastP = [double]$arr[$arr.Count - 1].P
+        $col = $c.Flat
+        if ($prev -gt 0) {
+            if ($lastP -gt ($prev + 0.0001)) { $col = $c.Up }
+            elseif ($lastP -lt ($prev - 0.0001)) { $col = $c.Down }
+        }
+        $pa = $pts.ToArray()
+        $fill = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $fill.AddLines($pa)
+        $fill.AddLine([single]($pa[$pa.Count - 1].X), [single]$by, [single]($pa[0].X), [single]$by)
+        $fill.CloseFigure()
+        $brFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, $col.R, $col.G, $col.B))
+        $g.FillPath($brFill, $fill)
+        $brFill.Dispose(); $fill.Dispose()
+
+        $penLine = New-Object System.Drawing.Pen($col, [single][math]::Max(1.2, 1.3 * $script:Scale))
+        $g.DrawLines($penLine, $pa)
+        $penLine.Dispose()
+
+        $r = [single][math]::Max(1.5, 2.0 * $script:Scale)
+        $brDot = New-Object System.Drawing.SolidBrush($col)
+        $g.FillEllipse($brDot, [single]($pa[$pa.Count - 1].X - $r), [single]($pa[$pa.Count - 1].Y - $r), [single]($r * 2), [single]($r * 2))
+        $brDot.Dispose()
+    }
+
+    if ($h -ge (Px 52)) {
+        $fAx = Get-Font (7 * $script:Scale) 'normal'
+        $g.DrawString("09:30", $fAx, $brSub, $lx, ($h - (Px 12)))
+        $sz = $g.MeasureString("15:00", $fAx)
+        $g.DrawString("15:00", $fAx, $brSub, [single]($rx - $sz.Width), [single]($h - (Px 12)))
+    }
+
+    $brSub.Dispose()
+    $penTop.Dispose()
+})
+
 # ---------- 缩放手柄 ----------
 $grip = New-Object System.Windows.Forms.Panel
 $grip.BackColor = $script:C.Bg
@@ -331,6 +458,12 @@ function Normalize-Code([string]$raw) {
 }
 
 # ---------- 请求行情 ----------
+# 分时接口只走 https（http 会 302），PS 5.1 默认协议可能不够，显式补上 TLS 1.2
+try {
+    $script:Tls = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol = $script:Tls
+} catch { }
+
 function Request-Quotes([string]$codes) {
     $out = @{}
     if (-not $codes) { return $out }
@@ -379,6 +512,79 @@ function Request-Quotes([string]$codes) {
         }
     }
     return $out
+}
+
+# ---------- 分时数据 ----------
+# 接口：https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh601088
+# 每行格式 "HHmm 价格 累计量 累计额"，一整天 240 个槽位（09:30-11:30、13:00-15:00）
+function Request-Minutes([string]$code) {
+    $out = @()
+    if (-not $code) { return $out }
+    $url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=$code"
+    $txt = $null
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($url)
+        $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        $req.Timeout = 3000
+        $req.ReadWriteTimeout = 3000
+        $req.KeepAlive = $false
+        $resp = $req.GetResponse()
+        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        $txt = $sr.ReadToEnd()
+        $sr.Close(); $resp.Close()
+    } catch {
+        return $out
+    }
+    if (-not $txt) { return $out }
+
+    try {
+        $j = $txt | ConvertFrom-Json
+        $node = $j.data.PSObject.Properties[$code]
+        if ($null -eq $node) { return $out }
+        foreach ($line in @($node.Value.data.data)) {
+            $p = ([string]$line) -split ' '
+            if ($p.Count -lt 2) { continue }
+            $t = $p[0]
+            if ($t -notmatch '^\d{4}$') { continue }
+            $v = 0.0
+            if (-not [double]::TryParse($p[1], [ref]$v)) { continue }
+            $mins = ([int]$t.Substring(0, 2)) * 60 + [int]$t.Substring(2, 2)
+            if ($mins -le 690) { $idx = $mins - 570 } else { $idx = 120 + ($mins - 780) }
+            if ($idx -lt 0) { $idx = 0 }
+            if ($idx -gt 240) { $idx = 240 }
+            $out += [pscustomobject]@{ T = $t; P = $v; I = $idx }
+        }
+    } catch { }
+    return $out
+}
+
+# 拉取频控：同一次展开最多 15 秒一次，避免分时数据把请求量翻倍
+function Load-Minutes([string]$code, [switch]$Force) {
+    if (-not $code) { return }
+    $now = Get-Date
+    if (-not $Force) {
+        $last = $script:MinAt[$code]
+        if ($null -ne $last -and ($now - $last).TotalSeconds -lt 15) { return }
+    }
+    $arr = @(Request-Minutes $code)
+    if ($arr.Count -gt 0) {
+        $script:Mins[$code]  = $arr
+        $script:MinAt[$code] = $now
+    }
+    if ($null -ne $script:Chart -and $script:ChartCode -eq $code) { $script:Chart.Invalidate() }
+}
+
+function Toggle-Chart([string]$code) {
+    if (-not $code) { return }
+    if ($script:ChartCode -eq $code) {
+        $script:ChartCode = ""
+    } else {
+        $script:ChartCode = $code
+        Load-Minutes $code -Force
+    }
+    Render
+    Layout-UI
+    Clamp-Bounds
 }
 
 # ---------- 自选持久化 ----------
@@ -561,6 +767,7 @@ function Add-Stock {
 
 # ---------- 移除 ----------
 function Remove-Stock([string]$code) {
+    if ($script:ChartCode -eq $code) { $script:ChartCode = "" }
     $script:Stocks = @($script:Stocks | Where-Object { $_.Code -ne $code })
     Save-Watch
     Build-Rows
@@ -574,6 +781,12 @@ function New-Menu([string]$code) {
     $m = New-Object System.Windows.Forms.ContextMenuStrip
 
     if ($code) {
+        $miChart = [System.Windows.Forms.ToolStripMenuItem]::new("查看分时")
+        $miChart.Name = "miChart"
+        $miChart.Tag  = $code
+        $miChart.Add_Click({ Toggle-Chart ([string]$this.Tag) })
+        [void]$m.Items.Add($miChart)
+
         $miDel = [System.Windows.Forms.ToolStripMenuItem]::new("移除该股")
         $miDel.Tag = $code
         $miDel.Add_Click({ Remove-Stock $this.Tag })
@@ -654,7 +867,10 @@ function New-Menu([string]$code) {
         $curScale = [int][Math]::Round($script:Scale * 100)
         $curAlpha = [int][Math]::Round($script:Alpha * 100)
         foreach ($x in $this.Items) {
-            if ($x.Text -eq "大小") {
+            if ($x.Name -eq "miChart") {
+                if ($script:ChartCode -eq [string]$x.Tag) { $x.Text = "收起分时" } else { $x.Text = "查看分时" }
+            }
+            elseif ($x.Text -eq "大小") {
                 foreach ($cc in $x.DropDown.Items) { $cc.Checked = ([int]$cc.Tag -eq $curScale) }
             }
             elseif ($x.Text -eq "透明度") {
@@ -773,6 +989,10 @@ function Build-Rows {
         foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) {
             $ctl = $row.$k
             $ctl.ContextMenuStrip = $menu
+            $ctl.Tag    = $code
+            $ctl.Cursor = [System.Windows.Forms.Cursors]::Hand
+            # 单击整行 → 展开 / 收起该股当日分时；拖动窗口不会误触（MouseUp 时已不在原控件上）
+            $ctl.Add_Click({ Toggle-Chart ([string]$this.Tag) })
             Bind-Drag $ctl
         }
         $script:UI += $row
@@ -813,7 +1033,9 @@ function Layout-UI {
     $W     = Px 320
     $HH    = [math]::Max((Px 29), 24)
     $blkH  = Px 74
-    $BodyH = (Px 10) + ($script:Stocks.Count * $blkH)
+    $chartH = 0
+    if ($script:ChartCode -and $script:Stocks.Count -gt 0) { $chartH = Px 86 }
+    $BodyH = (Px 10) + ($script:Stocks.Count * $blkH) + $chartH
     # 空态给一个固定高度，否则窗口会塌成只剩顶栏的一条细缝
     if ($script:Stocks.Count -eq 0) { $BodyH = Px 64 }
     $H     = $HH + $BodyH
@@ -854,6 +1076,19 @@ function Layout-UI {
 
     $body.Location = [System.Drawing.Point]::new(0, $HH)
     $body.Size     = [System.Drawing.Size]::new($W, $BodyH)
+
+    if ($null -ne $script:Chart) {
+        if ($chartH -gt 0) {
+            $script:Chart.Visible   = $true
+            $script:Chart.BackColor = $script:C.Bg
+            $script:Chart.Location  = [System.Drawing.Point]::new(0, ($BodyH - $chartH))
+            $script:Chart.Size      = [System.Drawing.Size]::new($W, $chartH)
+            $script:Chart.BringToFront()
+            $script:Chart.Invalidate()
+        } else {
+            $script:Chart.Visible = $false
+        }
+    }
 
     $fName  = Get-Font (9 * $s) 'normal'
     $fPct   = Get-Font (9.5 * $s) 'bold'
@@ -937,6 +1172,7 @@ function Set-Theme([string]$name) {
     $header.BackColor = $t.Head
     $body.BackColor   = $t.Bg
     $grip.BackColor   = $t.Bg
+    if ($null -ne $script:Chart) { $script:Chart.BackColor = $t.Bg }
 
     $lblStatus.BackColor = $t.Head
     $lblStatus.ForeColor = $t.Sub
@@ -1076,6 +1312,7 @@ function Render {
         }
 
         $u.Name.Text = "{0}  {1}" -f $d.Name, $def.Code.Substring(2)
+        if ($script:ChartCode -eq $def.Code) { $u.Name.Text = $u.Name.Text + "  ▾" }
 
         if ($d.Price -le 0) {
             $u.Price.Text = "停牌"
@@ -1118,6 +1355,9 @@ function Render {
     # 交易时段 1 秒拉一次；收盘 / 午休 / 未开盘完全不发请求，只留 30 秒一次的本地看表（到点自动恢复）
     if ($sess -eq "am" -or $sess -eq "pm") { $script:AutoMs = 1000 } else { $script:AutoMs = 30000 }
     Apply-Rate
+
+    # 分时图展开时跟一次（内部 15 秒频控，不会把请求量翻倍）
+    if ($script:ChartCode) { Load-Minutes $script:ChartCode }
 }
 
 # ================= 事件绑定 =================
