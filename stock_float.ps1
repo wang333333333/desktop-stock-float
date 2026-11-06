@@ -109,6 +109,8 @@ $script:Mins       = @{}     # code -> 分时点（T 时间 / P 价 / I 槽位 0
 $script:MinAt      = @{}     # code -> 上次拉分时的时刻
 $script:MinFail    = 0       # 分时连续失败次数，用于退避
 $script:Chart      = $null
+$script:ShowSpark  = $true   # 列表每行内嵌缩略分时（看大概），点击再去底部大图
+$script:SparkOf    = @{}     # code -> 该行的缩略分时面板
 
 # 列表滚动：一屏最多显示 N 只，超出后窗口高度固定、列表内部滚动
 # 0 = 自动（按屏幕工作区 60% 折算行数）；2/4/6/8/10 = 固定一屏几只
@@ -183,6 +185,16 @@ function Get-HeadFont([double]$factor) {
     $sz = $factor * $script:Scale
     if ($sz -lt 7.0) { $sz = 7.0 }
     return (Get-Font $sz 'normal')
+}
+
+# 价格列变窄后，"1,453.00" 这种千元股会撑出边界被裁，按字符数降一档字号
+function Get-PriceFont([string]$txt) {
+    $s = $script:Scale
+    $n = 0
+    if ($null -ne $txt) { $n = $txt.Length }
+    if ($n -ge 7) { return (Get-Font (13.5 * $s) 'bold') }
+    if ($n -ge 6) { return (Get-Font (15 * $s) 'bold') }
+    return (Get-Font (17 * $s) 'bold')
 }
 
 # ---------- 缩放下标（用户缩放 × 系统 DPI） ----------
@@ -758,6 +770,7 @@ function Load-Minutes([string]$code, [switch]$Force) {
         $script:MinFail++
     }
     if ($null -ne $script:Chart -and $script:ChartCode -eq $code) { $script:Chart.Invalidate() }
+    if ($script:SparkOf.ContainsKey($code)) { $script:SparkOf[$code].Invalidate() }
 }
 
 function Toggle-Chart([string]$code) {
@@ -771,6 +784,138 @@ function Toggle-Chart([string]$code) {
     Render
     Layout-UI
     Clamp-Bounds
+}
+
+# ---------- 行内缩略分时 ----------
+# 和大图同一套定档规则（以昨收为中轴对称），这样不同股票的缩略图
+# 看起来的"陡峭程度"可以直接横向比较；不画坐标轴、均线，只留走势 + 昨收虚线。
+function Draw-Spark($g, $pnl, [string]$code) {
+    $c = $script:C
+    $g.Clear($c.Bg)
+    $w = [single]$pnl.Width
+    $h = [single]$pnl.Height
+    if ($w -lt (Px 24) -or $h -lt (Px 12)) { return }
+
+    $arr = $null
+    if ($code -and $script:Mins.ContainsKey($code)) { $arr = $script:Mins[$code] }
+    if ($null -eq $arr -or $arr.Count -lt 2) { return }
+
+    $d = $null
+    if ($code) { $d = $script:State[$code] }
+    $prev = 0.0
+    if ($null -ne $d) { $prev = [double]$d.Prev }
+
+    $lo = [double]::MaxValue
+    $hi = [double]::MinValue
+    foreach ($pt in $arr) {
+        if ($pt.P -le 0) { continue }
+        if ($pt.P -lt $lo) { $lo = $pt.P }
+        if ($pt.P -gt $hi) { $hi = $pt.P }
+    }
+    if ($lo -gt $hi) { return }
+
+    # 缩略图按当日自身高低点铺满（和大图的昨收对称定档不同）：
+    # 这么小的尺寸里，只有把当日波动拉满才看得出形状，同花顺的缩略图也是这个逻辑。
+    # 但极窄的横盘（低价股 1 分钱一档）拉满会变成条形码，跨度至少给到昨收 1%
+    if ($prev -gt 0) {
+        $minSpan = [Math]::Max($prev * 0.01, 0.01)
+        if (($hi - $lo) -lt $minSpan) {
+            $mid = ($hi + $lo) / 2.0
+            $lo = $mid - $minSpan / 2.0
+            $hi = $mid + $minSpan / 2.0
+        }
+    }
+    $pad = ($hi - $lo) * 0.10
+    if ($pad -le 0.0001) { $pad = [Math]::Max([Math]::Abs($hi) * 0.002, 0.005) }
+    $lo -= $pad
+    $hi += $pad
+    $span = $hi - $lo
+    if ($span -le 0) { return }
+
+    $ty = [single](Px 2)
+    $by = [single]($h - (Px 2))
+    if ($by -le ($ty + 2)) { return }
+    $lx = [single](Px 1)
+    $rx = [single]($w - (Px 1))
+
+    if ($prev -gt 0 -and $prev -ge $lo -and $prev -le $hi) {
+        $py = $ty + ($hi - $prev) / $span * ($by - $ty)
+        $pdash = New-Object System.Drawing.Pen($c.Line, 1)
+        $pdash.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
+        $g.DrawLine($pdash, $lx, $py, $rx, $py)
+        $pdash.Dispose()
+    }
+
+    $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    foreach ($pt in $arr) {
+        if ($pt.P -le 0) { continue }
+        $ix = [double]$pt.I / 240.0
+        if ($ix -gt 1) { $ix = 1 }
+        if ($ix -lt 0) { $ix = 0 }
+        $px = $lx + $ix * ($rx - $lx)
+        $py2 = $ty + ($hi - $pt.P) / $span * ($by - $ty)
+        $pts.Add([System.Drawing.PointF]::new([single]$px, [single]$py2))
+    }
+    if ($pts.Count -lt 2) { return }
+
+    $lastP = [double]$arr[$arr.Count - 1].P
+    $col = $c.Flat
+    if ($prev -gt 0) {
+        if ($lastP -gt ($prev + 0.0001)) { $col = $c.Up }
+        elseif ($lastP -lt ($prev - 0.0001)) { $col = $c.Down }
+    }
+
+    $pa = $pts.ToArray()
+    $fill = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $fill.AddLines($pa)
+    $fill.AddLine([single]($pa[$pa.Count - 1].X), $by, [single]($pa[0].X), $by)
+    $fill.CloseFigure()
+    $brFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(22, $col.R, $col.G, $col.B))
+    $g.FillPath($brFill, $fill)
+    $brFill.Dispose(); $fill.Dispose()
+
+    $penLine = New-Object System.Drawing.Pen($col, [single][math]::Max(1.0, 1.0 * $script:Scale))
+    $g.DrawLines($penLine, $pa)
+    $penLine.Dispose()
+
+    $r = [single][math]::Max(1.4, 1.6 * $script:Scale)
+    $brDot = New-Object System.Drawing.SolidBrush($col)
+    $g.FillEllipse($brDot, [single]($pa[$pa.Count - 1].X - $r), [single]($pa[$pa.Count - 1].Y - $r), [single]($r * 2), [single]($r * 2))
+    $brDot.Dispose()
+}
+
+# 缩略分时取数：只补可见行，每拍最多 2 只（一轮下来约等于每只 3 秒一次），
+# 展开的大图仍按 1 秒优先刷新，总量不会随股票数线性膨胀。
+function Update-Sparks([switch]$All) {
+    if (-not $script:ShowSpark) { return }
+    if ($script:Stocks.Count -le 0) { return }
+    $now = Get-Date
+    $gap = 1.0
+    if ($script:MinFail -gt 0) { $gap = 3.0 }
+    $sess = Get-Session
+    $live = ($sess -eq "am" -or $sess -eq "pm")
+
+    $i0 = $script:TopRow
+    $i1 = $script:TopRow + $script:VisRows - 1
+    if ($i1 -gt ($script:Stocks.Count - 1)) { $i1 = $script:Stocks.Count - 1 }
+
+    $queue = @()
+    $stale = @()
+    for ($i = $i0; $i -le $i1; $i++) {
+        $cd = [string]$script:Stocks[$i].Code
+        if ($cd -eq $script:ChartCode) { continue }
+        $t = $script:MinAt[$cd]
+        if ($null -eq $t) { $queue += $cd }
+        elseif (-not $live -and $script:Mins.ContainsKey($cd)) { }   # 收盘后拿到过的当日曲线不再重复拉
+        elseif (($now - $t).TotalSeconds -ge $gap) { $stale += [pscustomobject]@{ C = $cd; T = $t } }
+    }
+    foreach ($o in @($stale | Sort-Object T)) { $queue += $o.C }
+    if ($queue.Count -eq 0) { return }
+
+    $n = 2
+    if ($All) { $n = $queue.Count }
+    if ($n -gt $queue.Count) { $n = $queue.Count }
+    for ($k = 0; $k -lt $n; $k++) { Load-Minutes ([string]$queue[$k]) -Force }
 }
 
 # ---------- 自选持久化 ----------
@@ -1072,6 +1217,18 @@ function New-Menu([string]$code) {
     }
     [void]$m.Items.Add($miRows)
 
+    # 行内缩略分时开关：默认开着，嫌挤可以关掉（关掉后名字和涨幅回到宽版布局）
+    $miSpark = [System.Windows.Forms.ToolStripMenuItem]::new("行内缩略分时")
+    $miSpark.Name = "miSpark"
+    $miSpark.ShowCheckMargin = $true
+    $miSpark.Add_Click({
+        $script:ShowSpark = -not $script:ShowSpark
+        Layout-UI
+        Render
+        Save-Pos
+    })
+    [void]$m.Items.Add($miSpark)
+
     $m.Add_Opening({
         $curScale = [int][Math]::Round($script:Scale * 100)
         $curAlpha = [int][Math]::Round($script:Alpha * 100)
@@ -1093,6 +1250,9 @@ function New-Menu([string]$code) {
             }
             elseif ($x.Name -eq "miRows") {
                 foreach ($cc in $x.DropDown.Items) { $cc.Checked = ([int]$cc.Tag -eq [int]$script:RowsCap) }
+            }
+            elseif ($x.Name -eq "miSpark") {
+                $x.Checked = [bool]$script:ShowSpark
             }
         }
     })
@@ -1142,13 +1302,14 @@ function Bind-Drag($ctrl) {
 # ---------- 重建行 ----------
 function Build-Rows {
     foreach ($u in $script:UI) {
-        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) { $u.$k.Dispose() }
+        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info", "Spark")) { $u.$k.Dispose() }
     }
     foreach ($sp in $script:Seps) { $sp.Dispose() }
     foreach ($em in $script:Empty) { $em.Dispose() }
     $script:UI    = @()
     $script:Seps  = @()
     $script:Empty = @()
+    $script:SparkOf = @{}
 
     $c = $script:C
     for ($i = 0; $i -lt $script:Stocks.Count; $i++) {
@@ -1157,6 +1318,7 @@ function Build-Rows {
         $ln = New-Object System.Windows.Forms.Label
         $ln.BackColor = $c.Bg; $ln.ForeColor = $c.Text
         $ln.AutoSize  = $false
+        $ln.AutoEllipsis = $true
         $ln.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
         $ln.Text      = ""
         $body.Controls.Add($ln)
@@ -1189,6 +1351,19 @@ function Build-Rows {
         $li.Text      = ""
         $body.Controls.Add($li)
 
+        # 行内缩略分时：名字和涨幅之间的空档，够看趋势；点它同样展开底部大图
+        $sk = New-Object System.Windows.Forms.Panel
+        $sk.BackColor = $c.Bg
+        $sk.Visible   = $false
+        $sk.Tag       = $code
+        Set-DoubleBuffered $sk
+        $sk.Add_Paint({
+            param($s, $e)
+            try { Draw-Spark $e.Graphics $s ([string]$s.Tag) } catch { }
+        })
+        $body.Controls.Add($sk)
+        $script:SparkOf[$code] = $sk
+
         if ($i -lt ($script:Stocks.Count - 1)) {
             $sep = New-Object System.Windows.Forms.Panel
             $sep.BackColor = $c.Line
@@ -1197,8 +1372,8 @@ function Build-Rows {
         }
 
         $menu = New-Menu $code
-        $row  = [pscustomobject]@{ Name = $ln; Pct = $lp; Price = $lpr; Delta = $ld; Info = $li }
-        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) {
+        $row  = [pscustomobject]@{ Name = $ln; Pct = $lp; Price = $lpr; Delta = $ld; Info = $li; Spark = $sk }
+        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info", "Spark")) {
             $ctl = $row.$k
             $ctl.ContextMenuStrip = $menu
             $ctl.Tag    = $code
@@ -1438,6 +1613,11 @@ function Layout-UI {
 
     $right = $W - (Px 12)
 
+    # 开缩略分时：中间让出一列给它，名字/价格收窄，涨幅/涨跌额整体右移成窄列
+    $spOn   = [bool]$script:ShowSpark
+    $nameW  = $(if ($spOn) { Px 104 } else { Px 172 })
+    $priceW = $(if ($spOn) { Px 106 } else { Px 160 })
+
     for ($i = 0; $i -lt $script:Stocks.Count; $i++) {
         $u   = $script:UI[$i]
         # 滚动就是整体往上挪 TopRow 行的距离；超出 body 的部分由父容器自然裁掉
@@ -1447,25 +1627,40 @@ function Layout-UI {
         foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) {
             if ($u.$k.Visible -ne $vis) { $u.$k.Visible = $vis }
         }
+        $sv = ($vis -and $spOn)
+        if ($u.Spark.Visible -ne $sv) { $u.Spark.Visible = $sv }
 
         $u.Name.Font  = $fName
-        $u.Name.Location = [System.Drawing.Point]::new((Px 12), $top)
-        $u.Name.Size     = [System.Drawing.Size]::new((Px 178), (Px 18))
+        $u.Name.Location = [System.Drawing.Point]::new((Px 12), ($top + (Px 1)))
+        $u.Name.Size     = [System.Drawing.Size]::new($nameW, (Px 17))
 
-        $u.Pct.Font  = $fPct
-        $u.Pct.Location = [System.Drawing.Point]::new(($right - (Px 116)), ($top - (Px 1)))
-        $u.Pct.Size     = [System.Drawing.Size]::new((Px 116), (Px 19))
-
-        $u.Price.Font  = $fPrice
+        $u.Price.Font  = Get-PriceFont ([string]$u.Price.Text)
         $u.Price.Location = [System.Drawing.Point]::new((Px 10), ($top + (Px 15)))
-        $u.Price.Size     = [System.Drawing.Size]::new((Px 160), (Px 32))
+        $u.Price.Size     = [System.Drawing.Size]::new($priceW, (Px 32))
 
-        $u.Delta.Font  = $fDelta
-        $u.Delta.Location = [System.Drawing.Point]::new(($right - (Px 128)), ($top + (Px 26)))
-        $u.Delta.Size     = [System.Drawing.Size]::new((Px 128), (Px 17))
+        if ($spOn) {
+            $u.Spark.Location = [System.Drawing.Point]::new((Px 116), ($top + (Px 16)))
+            $u.Spark.Size     = [System.Drawing.Size]::new((Px 112), (Px 32))
+
+            $u.Pct.Font  = $fPct
+            $u.Pct.Location = [System.Drawing.Point]::new((Px 232), ($top + (Px 5)))
+            $u.Pct.Size     = [System.Drawing.Size]::new((Px 76), (Px 19))
+
+            $u.Delta.Font  = $fDelta
+            $u.Delta.Location = [System.Drawing.Point]::new((Px 232), ($top + (Px 29)))
+            $u.Delta.Size     = [System.Drawing.Size]::new((Px 76), (Px 16))
+        } else {
+            $u.Pct.Font  = $fPct
+            $u.Pct.Location = [System.Drawing.Point]::new(($right - (Px 116)), ($top - (Px 1)))
+            $u.Pct.Size     = [System.Drawing.Size]::new((Px 116), (Px 19))
+
+            $u.Delta.Font  = $fDelta
+            $u.Delta.Location = [System.Drawing.Point]::new(($right - (Px 128)), ($top + (Px 26)))
+            $u.Delta.Size     = [System.Drawing.Size]::new((Px 128), (Px 17))
+        }
 
         $u.Info.Font  = $fInfo
-        $u.Info.Location = [System.Drawing.Point]::new((Px 12), ($top + (Px 50)))
+        $u.Info.Location = [System.Drawing.Point]::new((Px 12), ($top + (Px 51)))
         $u.Info.Size     = [System.Drawing.Size]::new(($W - (Px 24)), (Px 15))
 
         if ($i -lt $script:Seps.Count) {
@@ -1544,8 +1739,9 @@ function Set-Theme([string]$name) {
     $btnMin.Invalidate()
 
     foreach ($u in $script:UI) {
-        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info")) { $u.$k.BackColor = $t.Bg }
+        foreach ($k in @("Name", "Pct", "Price", "Delta", "Info", "Spark")) { $u.$k.BackColor = $t.Bg }
         $u.Name.ForeColor = $t.Text
+        if ($null -ne $u.Spark) { $u.Spark.Invalidate() }
     }
     foreach ($sp in $script:Seps) { $sp.BackColor = $t.Line }
     if ($script:Empty.Count -ge 2) {
@@ -1570,6 +1766,7 @@ function Save-Pos {
             Alpha = $script:Alpha
             Rate  = $(if ($script:RateMode -eq "auto") { "auto" } else { [string]$script:RateMs })
             Rows  = $script:RowsCap
+            Spark = [bool]$script:ShowSpark
         }
         $o | ConvertTo-Json -Compress | Out-File -FilePath $PosFile -Encoding ascii -Force
     } catch { }
@@ -1658,6 +1855,9 @@ function Fetch-Quotes {
     $script:ErrCount = 0
     foreach ($k in $q.Keys) { $script:State[$k] = $q[$k] }
     Render
+    # 启动 / 加股 / 手动刷新这几种强制刷新，顺手把可见行的分时一次补齐，
+    # 否则要等轮转好几拍才会出现第一张缩略图
+    if ($Force) { Update-Sparks -All }
 }
 
 # ---------- 渲染 ----------
@@ -1674,11 +1874,17 @@ function Render {
             continue
         }
 
-        $u.Name.Text = "{0}  {1}" -f $d.Name, $def.Code.Substring(2)
+        if ($script:ShowSpark) {
+            # 缩略分时占了中间一列，名字这边只留名称，代码挪到下面一行跟着开高低一起看
+            $u.Name.Text = [string]$d.Name
+        } else {
+            $u.Name.Text = "{0}  {1}" -f $d.Name, $def.Code.Substring(2)
+        }
         if ($script:ChartCode -eq $def.Code) { $u.Name.Text = $u.Name.Text + "  ▾" }
 
         if ($d.Price -le 0) {
             $u.Price.Text = "停牌"
+            $u.Price.Font = Get-PriceFont "停牌"
             $u.Price.ForeColor = $c.Sub
             $u.Pct.Text = ""
             $u.Delta.Text = ""
@@ -1692,6 +1898,7 @@ function Render {
             else { $col = $c.Flat }
 
             $u.Price.Text = "{0:N2}" -f $d.Price
+            $u.Price.Font = Get-PriceFont ([string]$u.Price.Text)
             $u.Price.ForeColor = $col
             $sign = ""
             if ($pct -gt 0) { $sign = "+" }
@@ -1706,7 +1913,11 @@ function Render {
         if ($d.Price -le 0) {
             $u.Info.Text = ""
         } else {
-            $u.Info.Text = "今开 {0:N2}   最高 {1:N2}   最低 {2:N2}" -f $d.Open, $d.High, $d.Low
+            if ($script:ShowSpark) {
+                $u.Info.Text = "{0}   今开 {1:N2}   最高 {2:N2}   最低 {3:N2}" -f $def.Code.Substring(2), $d.Open, $d.High, $d.Low
+            } else {
+                $u.Info.Text = "今开 {0:N2}   最高 {1:N2}   最低 {2:N2}" -f $d.Open, $d.High, $d.Low
+            }
             $u.Info.ForeColor = $c.Sub
         }
     }
@@ -1721,6 +1932,8 @@ function Render {
 
     # 分时图展开时跟着报价一起刷新（同为盘中 1 秒），末尾才不会比上方价格慢一拍
     if ($script:ChartCode) { Load-Minutes $script:ChartCode }
+    # 每行的缩略分时按可见行轮流补，保证窗口里每一只都能看到当日走势
+    Update-Sparks
 }
 
 # ================= 事件绑定 =================
@@ -1897,6 +2110,9 @@ if (Test-Path $PosFile) {
         $rn = -1
         if (($saved.PSObject.Properties.Name -contains "Rows") -and [int]::TryParse([string]$saved.Rows, [ref]$rn)) {
             if ($rn -ge 0) { $script:RowsCap = $rn }
+        }
+        if ($saved.PSObject.Properties.Name -contains "Spark") {
+            $script:ShowSpark = [bool]$saved.Spark
         }
         # 老配置只有 Cap 布尔值：关着就当自动，开着沿用默认 6 只
         elseif ($saved.PSObject.Properties.Name -contains "Cap") {
