@@ -57,6 +57,7 @@ $script:Dragging   = $false
 $script:DragCursor = $null
 $script:DragForm   = $null
 $script:ErrCount   = 0
+$script:LastSess   = ""
 $script:Scale      = 1.0
 $script:Dpi        = 1.0
 $script:Alpha      = 0.93
@@ -992,12 +993,25 @@ function Get-Session {
     $now = Get-Date
     $wk  = $now.DayOfWeek
     if ($wk -eq [System.DayOfWeek]::Saturday -or $wk -eq [System.DayOfWeek]::Sunday) { return "closed" }
-    $hm = $now.ToString("HHmm")
-    if ($hm -lt "0915") { return "pre" }
-    if ($hm -le "1135") { return "am" }
-    if ($hm -lt "1255") { return "lunch" }
-    if ($hm -le "1505") { return "pm" }
-    return "closed"
+    # 按秒比较，不设宽限：11:30:00 一到立刻停，15:00:00 一到立刻停
+    $t = $now.TimeOfDay.TotalSeconds
+    if ($t -lt 33300) { return "pre" }      # 09:15:00 集合竞价前
+    if ($t -lt 41400) { return "am" }       # 09:15:00 - 11:30:00
+    if ($t -lt 46800) { return "lunch" }    # 11:30:00 - 13:00:00
+    if ($t -lt 54000) { return "pm" }       # 13:00:00 - 15:00:00
+    return "closed"                         # 15:00:00 之后
+}
+
+# 状态栏文案：交易时段显示本机抓取时刻（秒在跳 = 在拉），非交易时段显示时段名
+function Set-Status([string]$sess) {
+    switch ($sess) {
+        "am"    { $script:LblStatus.Text = Get-Date -Format "HH:mm:ss" }
+        "pm"    { $script:LblStatus.Text = Get-Date -Format "HH:mm:ss" }
+        "lunch" { $script:LblStatus.Text = "午休" }
+        "pre"   { $script:LblStatus.Text = "未开盘" }
+        default { $script:LblStatus.Text = "已收盘" }
+    }
+    if ($script:ErrCount -lt 3) { $script:LblStatus.ForeColor = $script:C.Sub }
 }
 
 # ---------- 刷新频率 ----------
@@ -1012,16 +1026,21 @@ function Apply-Rate {
 function Fetch-Quotes {
     param([switch]$Force)
 
+    $sess = Get-Session
+    $live = ($sess -eq "am" -or $sess -eq "pm")
+    # 上一拍还在交易、这一拍已经收盘 → 补拉一次把最终价定格，之后不再发请求
+    $justClosed = (-not $live) -and ($script:LastSess -eq "am" -or $script:LastSess -eq "pm")
+    $script:LastSess = $sess
+
     # 自选清空后没有任何代码可查，直接跳过；否则空查询会被当成“拉取失败”误报网络异常
-    if ($script:Stocks.Count -eq 0) { Render; return }
+    if ($script:Stocks.Count -eq 0) { Set-Status $sess; Render; return }
 
     # 非交易时段直接不发请求（-Force 用于启动 / 加股票 / 手动刷新，需要拿到收盘价显示）
-    if (-not $Force) {
-        $sess = Get-Session
-        if ($sess -ne "am" -and $sess -ne "pm") {
-            if ($null -ne $script:Timer -and $script:Timer.Interval -ne 30000) { $script:Timer.Interval = 30000 }
-            return
-        }
+    if (-not $Force -and -not $live -and -not $justClosed) {
+        $script:AutoMs = 30000
+        if ($null -ne $script:Timer -and $script:Timer.Interval -ne 30000) { $script:Timer.Interval = 30000 }
+        Set-Status $sess
+        return
     }
 
     $codes = ($script:Stocks | ForEach-Object { $_.Code }) -join ","
@@ -1094,14 +1113,7 @@ function Render {
 
     # 状态：交易时段显示本机抓取时刻（秒在跳 = 在拉）；非交易时段显示「已收盘 / 午休 / 未开盘」
     $sess = Get-Session
-    switch ($sess) {
-        "am"    { $lblStatus.Text = Get-Date -Format "HH:mm:ss" }
-        "pm"    { $lblStatus.Text = Get-Date -Format "HH:mm:ss" }
-        "lunch" { $lblStatus.Text = "午休" }
-        "pre"   { $lblStatus.Text = "未开盘" }
-        default { $lblStatus.Text = "已收盘" }
-    }
-    if ($script:ErrCount -lt 3) { $lblStatus.ForeColor = $c.Sub }
+    Set-Status $sess
 
     # 交易时段 1 秒拉一次；收盘 / 午休 / 未开盘完全不发请求，只留 30 秒一次的本地看表（到点自动恢复）
     if ($sess -eq "am" -or $sess -eq "pm") { $script:AutoMs = 1000 } else { $script:AutoMs = 30000 }
